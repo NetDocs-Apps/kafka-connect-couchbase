@@ -248,8 +248,10 @@ See that property's documentation for details.
 The class name of the event filter to use.
 The event filter determines whether a database change event is ignored.
 
-When using a non-default filter, consider also configuring `couchbase.black.hole.topic`.
-See that property's documentation for details.
+As of version 4.2.4, the default filter ignores events from the Couchbase `_system` scope.
+If you are interested in those events too, set this property to `com.couchbase.connect.kafka.filter.AllPassIncludingSystemFilter`.
+
+See also `couchbase.black.hole.topic`.
 
 * Type: class
 * Default: `com.couchbase.connect.kafka.filter.AllPassFilter`
@@ -267,6 +269,27 @@ After a record is published to this topic, the record is no longer important, an
 To reduce disk usage, configure this topic to use small segments and the lowest possible retention settings.
 
 * Since: 4.1.8
+
+* Type: string
+* Default: `""`
+* Importance: medium
+
+[[couchbase.initial.offset.topic]]
+=== `couchbase.initial.offset.topic`
+
+If `couchbase.stream.from` is `SAVED_OFFSET_OR_NOW`, and this property is non-blank, on startup the connector publishes to the named topic one tiny synthetic record for each source partition that does not yet have a saved offset.
+
+This lets the connector initialize the missing source offsets to "now" (the current state of Couchbase).
+
+The synthetic records have a value of null, and the same key: `__COUCHBASE_INITIAL_OFFSET_TOMBSTONE__a54ee32b-4a7e-4d98-aa36-45d8417e942a`.
+
+Consumers of this topic must ignore (or tolerate) these records.
+
+If you specify a value for `couchbase.black.hole.topic`, specify the same value here.
+
+UNCOMMITTED; this feature may change in a patch release without notice.
+
+* Since: 4.2.4
 
 * Type: string
 * Default: `""`
