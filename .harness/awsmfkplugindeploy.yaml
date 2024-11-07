@@ -1,0 +1,31 @@
+pipeline:
+  name: aws-mfk-plugin-deploy
+  identifier: awsmfkplugindeploy
+  tags: {}
+  template:
+    templateRef: account.appstackiacdeployment
+    templateInputs:
+      stages:
+        - stage:
+            identifier: iac_deployment
+            type: IACM
+            spec:
+              infrastructure:
+                type: KubernetesDirect
+                spec:
+                  connectorRef: <+input>
+                  namespace: <+input>
+              workspace: <+input>
+      variables:
+        - name: gitHash
+          type: String
+          value: <+input>
+        - name: portRunID
+          type: String
+          value: <+input>
+      properties:
+        ci:
+          codebase:
+            build: <+input>
+  projectIdentifier: kafkaconnect
+  orgIdentifier: eng
