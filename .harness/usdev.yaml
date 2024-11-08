@@ -1,0 +1,34 @@
+inputSet:
+  pipeline:
+    identifier: awsmfkplugindeploy
+    template:
+      templateInputs:
+        stages:
+          - stage:
+              identifier: iac_deployment
+              type: IACM
+              spec:
+                infrastructure:
+                  type: KubernetesDirect
+                  spec:
+                    connectorRef: account.nonprod
+                    namespace: delegate-non-prod
+                workspace: usdev
+        variables:
+          - name: gitHash
+            type: String
+            value: 50cf94778145dc49a8025320e9c21f365bc57b51
+          - name: portRunID
+            type: String
+            value: ""
+        properties:
+          ci:
+            codebase:
+              build:
+                spec:
+                  branch: "325162_2"
+                type: branch
+  name: us-dev
+  identifier: usdev
+  orgIdentifier: eng
+  projectIdentifier: kafkaconnect
