@@ -1,5 +1,5 @@
 module "cb-directory-acc-stream" {
-  source         = "github.com/NetDocs-Apps/tf-msk-connector-mod-iac?ref=v0.1//mod/msk-connector"
+  source         = "github.com/NetDocs-Apps/tf-msk-connector-mod-iac?ref=v0.1"
   connector_name = "cb-directory-acc-stream"
   msk_plugin = {
     arn      = module.msk-plugin.arn
@@ -24,7 +24,7 @@ module "cb-directory-acc-stream" {
 }
 
 module "cb-directory-search-stream" {
-  source         = "github.com/NetDocs-Apps/tf-msk-connector-mod-iac?ref=v0.1//mod/msk-connector"
+  source         = "github.com/NetDocs-Apps/tf-msk-connector-mod-iac?ref=v0.1"
   connector_name = "cb-directory-search-stream"
   msk_plugin = {
     arn      = module.msk-plugin.arn
@@ -49,7 +49,7 @@ module "cb-directory-search-stream" {
 }
 
 module "cb-nmd-acl-stream" {
-  source         = "github.com/NetDocs-Apps/tf-msk-connector-mod-iac?ref=v0.1//mod/msk-connector"
+  source         = "github.com/NetDocs-Apps/tf-msk-connector-mod-iac?ref=v0.1"
   connector_name = "cb-nmd-acl-stream"
   msk_plugin = {
     arn      = module.msk-plugin.arn
@@ -74,7 +74,7 @@ module "cb-nmd-acl-stream" {
 }
 
 module "cb-nmd-history-stream-split" {
-  source         = "github.com/NetDocs-Apps/tf-msk-connector-mod-iac?ref=v0.1//mod/msk-connector"
+  source         = "github.com/NetDocs-Apps/tf-msk-connector-mod-iac?ref=v0.1"
   connector_name = "cb-nmd-history-stream-split"
   msk_plugin = {
     arn      = module.msk-plugin.arn
@@ -99,7 +99,7 @@ module "cb-nmd-history-stream-split" {
 }
 
 module "cb-nmd-metadata-stream" {
-  source         = "github.com/NetDocs-Apps/tf-msk-connector-mod-iac?ref=v0.1//mod/msk-connector"
+  source         = "github.com/NetDocs-Apps/tf-msk-connector-mod-iac?ref=v0.1"
   connector_name = "cb-nmd-metadata-stream"
   msk_plugin = {
     arn      = module.msk-plugin.arn
@@ -124,7 +124,7 @@ module "cb-nmd-metadata-stream" {
 }
 
 module "cb-nmd-metadata-stream-split" {
-  source         = "github.com/NetDocs-Apps/tf-msk-connector-mod-iac?ref=v0.1//mod/msk-connector"
+  source         = "github.com/NetDocs-Apps/tf-msk-connector-mod-iac?ref=v0.1"
   connector_name = "cb-nmd-metadata-stream-split"
   msk_plugin = {
     arn      = module.msk-plugin.arn
