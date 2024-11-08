@@ -3,7 +3,7 @@ pipeline:
   identifier: awsmfkplugindeploy
   tags: {}
   template:
-    templateRef: account.appstackiacdeployment
+    templateRef: kafkaconnectiacdeployment
     templateInputs:
       stages:
         - stage:
