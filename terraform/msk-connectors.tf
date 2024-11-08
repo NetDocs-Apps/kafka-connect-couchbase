@@ -1,5 +1,5 @@
 module "cb-directory-acc-stream" {
-  source         = "github.com/NetDocs-Apps/tf-msk-connector-mod-iac?ref=v0.1"
+  source         = "github.com/NetDocs-Apps/tf-dynamodb-mod-iac?ref=v0.7"
   connector_name = "cb-directory-acc-stream"
   msk_plugin = {
     arn      = module.msk-plugin.arn
