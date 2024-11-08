@@ -1,5 +1,5 @@
 module "cb-directory-acc-stream" {
-  source         = "github.com/NetDocs-Apps/tf-msk-connector-mod-iac?v0.1//mod/msk-connector"
+  source         = "github.com/NetDocs-Apps/tf-msk-connector-mod-iac?ref=v0.1//mod/msk-connector"
   connector_name = "cb-directory-acc-stream"
   msk_plugin = {
     arn      = module.msk-plugin.arn
@@ -17,14 +17,14 @@ module "cb-directory-acc-stream" {
     worker_count = 1
   }
   worker_configuration = {
-    arn      = module.ndcb-worker-with-offset-topic.arn
-    revision = module.ndcb-worker-with-offset-topic.revision
+    arn      = module.ndcb-worker-secrets-offset-topic.arn
+    revision = module.ndcb-worker-secrets-offset-topic.revision
   }
   iam_role = var.iam_role
 }
 
 module "cb-directory-search-stream" {
-  source         = "github.com/NetDocs-Apps/tf-msk-connector-mod-iac?v0.1//mod/msk-connector"
+  source         = "github.com/NetDocs-Apps/tf-msk-connector-mod-iac?ref=v0.1//mod/msk-connector"
   connector_name = "cb-directory-search-stream"
   msk_plugin = {
     arn      = module.msk-plugin.arn
@@ -42,14 +42,14 @@ module "cb-directory-search-stream" {
     worker_count = 1
   }
   worker_configuration = {
-    arn      = module.ndcb-worker-with-offset-topic.arn
-    revision = module.ndcb-worker-with-offset-topic.revision
+    arn      = module.ndcb-worker-secrets-offset-topic.arn
+    revision = module.ndcb-worker-secrets-offset-topic.revision
   }
   iam_role = var.iam_role
 }
 
 module "cb-nmd-acl-stream" {
-  source         = "github.com/NetDocs-Apps/tf-msk-connector-mod-iac?v0.1//mod/msk-connector"
+  source         = "github.com/NetDocs-Apps/tf-msk-connector-mod-iac?ref=v0.1//mod/msk-connector"
   connector_name = "cb-nmd-acl-stream"
   msk_plugin = {
     arn      = module.msk-plugin.arn
@@ -67,14 +67,14 @@ module "cb-nmd-acl-stream" {
     worker_count = 1
   }
   worker_configuration = {
-    arn      = module.ndcb-worker-with-offset-topic.arn
-    revision = module.ndcb-worker-with-offset-topic.revision
+    arn      = module.ndcb-worker-secrets-offset-topic.arn
+    revision = module.ndcb-worker-secrets-offset-topic.revision
   }
   iam_role = var.iam_role
 }
 
 module "cb-nmd-history-stream-split" {
-  source         = "github.com/NetDocs-Apps/tf-msk-connector-mod-iac?v0.1//mod/msk-connector"
+  source         = "github.com/NetDocs-Apps/tf-msk-connector-mod-iac?ref=v0.1//mod/msk-connector"
   connector_name = "cb-nmd-history-stream-split"
   msk_plugin = {
     arn      = module.msk-plugin.arn
@@ -99,7 +99,7 @@ module "cb-nmd-history-stream-split" {
 }
 
 module "cb-nmd-metadata-stream" {
-  source         = "github.com/NetDocs-Apps/tf-msk-connector-mod-iac?v0.1//mod/msk-connector"
+  source         = "github.com/NetDocs-Apps/tf-msk-connector-mod-iac?ref=v0.1//mod/msk-connector"
   connector_name = "cb-nmd-metadata-stream"
   msk_plugin = {
     arn      = module.msk-plugin.arn
@@ -124,7 +124,7 @@ module "cb-nmd-metadata-stream" {
 }
 
 module "cb-nmd-metadata-stream-split" {
-  source         = "github.com/NetDocs-Apps/tf-msk-connector-mod-iac?v0.1//mod/msk-connector"
+  source         = "github.com/NetDocs-Apps/tf-msk-connector-mod-iac?ref=v0.1//mod/msk-connector"
   connector_name = "cb-nmd-metadata-stream-split"
   msk_plugin = {
     arn      = module.msk-plugin.arn
