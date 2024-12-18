@@ -119,7 +119,7 @@ class NDSourceHandlerTest {
 
         PutObjectRequest putObjectRequest = requestCaptor.getValue();
         assertEquals("test-bucket", putObjectRequest.bucket());
-        assertTrue(putObjectRequest.key().startsWith("test-key/"));
+        assertTrue(putObjectRequest.key().startsWith("directory/test-key/"));
         assertTrue(putObjectRequest.key().endsWith(".json"));
     }
 
