@@ -273,13 +273,14 @@ public class NDSourceHandler extends RawJsonWithMetadataSourceHandler {
 
   /**
    * Generates a unique S3 key for the document based on its key, document
-   * property ID,
-   * and revision sequence number.
+   * property ID,and revision sequence number if it is a document type event.
+   * If it is not a document type event it calls the generateS3KeyForDirectory
+   * method and returns the result.
    *
    * @param docEvent The document event containing metadata about the document
    * @return A unique S3 key string
    */
-  private String generateS3Key(DocumentEvent docEvent) {
+  String generateS3Key(DocumentEvent docEvent) {
     String originalKey = docEvent.key();
     long revisionSeqno = docEvent.revisionSeqno();
 
@@ -289,6 +290,11 @@ public class NDSourceHandler extends RawJsonWithMetadataSourceHandler {
     // Modify the key to add '/' after each of the next four letters after the
     // existing '/'
     String modifiedKey = modifyKey(originalKey);
+
+    // Not a document
+    if (modifiedKey == originalKey && (docPropsId == null || docPropsId.equals("unknown"))) {
+      return generateS3KeyForDirectory(docEvent);
+    }
 
     // Combine modified key, docProps.id, and revision sequence number to form the
     // S3 key
@@ -336,7 +342,7 @@ public class NDSourceHandler extends RawJsonWithMetadataSourceHandler {
   /**
    * Handles extraction of specific fields from the document.
    */
-  private boolean handleSpecificFieldsExtractionMutation(DocumentEvent docEvent, DocumentEvent.Type type,
+  boolean handleSpecificFieldsExtractionMutation(DocumentEvent docEvent, DocumentEvent.Type type,
       SourceHandlerParams params, SourceRecordBuilder builder) {
     final byte[] content = docEvent.content();
     final Map<String, Object> newValue;
@@ -347,12 +353,31 @@ public class NDSourceHandler extends RawJsonWithMetadataSourceHandler {
     }
 
     try {
-      builder.value(null, convertToBytes(newValue, docEvent, ""));
+      byte[] value = convertToBytes(newValue, docEvent, "");
+      if (value.length > s3Threshold) {
+        String s3Key = generateS3Key(docEvent);
+        uploadToS3(s3Key, value);
+        value = String.format("{\"s3Bucket\":\"%s\",\"s3Key\":\"%s\"}", s3Bucket, s3Key).getBytes();
+      }
+      builder.value(null, value);
       return true;
     } catch (DataException e) {
       LOGGER.error("Failed to serialize data", e);
       return false;
     }
+  }
+
+  /**
+   * Generates an S3 key for directory-based storage of document events.
+   *
+   * @param docEvent The document event containing metadata about the document
+   * @return A unique S3 key string for directory-based storage
+   */
+  String generateS3KeyForDirectory(DocumentEvent docEvent) {
+    String key = docEvent.key();
+    long revisionSeqno = docEvent.revisionSeqno();
+
+    return String.format("directory/%s/%d.json", key, revisionSeqno);
   }
 
   /**
