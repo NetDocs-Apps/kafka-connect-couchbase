@@ -22,7 +22,11 @@ import java.util.HashMap;
 import java.util.Map;
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.*;
+
+import org.mockito.Mockito;
+import org.mockito.MockitoAnnotations;
 
 @ExtendWith(MockitoExtension.class)
 class NDSourceHandlerTest {
@@ -36,8 +40,18 @@ class NDSourceHandlerTest {
     @Mock
     private DocumentEvent mockEvent;
 
+    @Mock
+    private DocumentEvent mockDocEvent;
+
+    @Mock
+    private SourceHandlerParams mockParams;
+
+    @Mock
+    private SourceRecordBuilder mockBuilder;
+
     @BeforeEach
     void setUp() {
+        MockitoAnnotations.openMocks(this);
         handler = new NDSourceHandler();
         objectMapper = new ObjectMapper();
     }
@@ -221,5 +235,78 @@ class NDSourceHandlerTest {
 
         assertTrue(foundSpecVersion, "CloudEvent spec version header not found");
         assertTrue(foundContentType, "CloudEvent content-type header not found");
+    }
+
+    @Test
+    void testGenerateS3KeyForDirectory() {
+        // Arrange
+        DocumentEvent mockEvent = Mockito.mock(DocumentEvent.class);
+        Mockito.when(mockEvent.key()).thenReturn("testKey");
+        Mockito.when(mockEvent.revisionSeqno()).thenReturn(123L);
+
+        // Act
+        String result = handler.generateS3KeyForDirectory(mockEvent);
+
+        // Assert
+        assertEquals("directory/testKey/123.json", result);
+    }
+
+    @Test
+    void testHandleSpecificFieldsExtractionMutation() {
+        initializeHandler(true, "field1,fields2", 1000, "test.event", ".s3");
+        // Arrange
+        when(mockDocEvent.type()).thenReturn(DocumentEvent.Type.MUTATION);
+        when(mockDocEvent.content()).thenReturn("{\"field1\":\"value1\",\"field2\":\"value2\"}".getBytes());
+        when(mockDocEvent.key()).thenReturn("testKey");
+        when(mockDocEvent.bucket()).thenReturn("testBucket");
+        when(mockDocEvent.revisionSeqno()).thenReturn(123L);
+        // when(mockParams.documentEvent()).thenReturn(mockDocEvent);
+        handler.setS3Client(mockS3Client);
+        // Act
+        boolean result = handler.handleSpecificFieldsExtractionMutation(mockDocEvent, DocumentEvent.Type.MUTATION,
+                mockParams, mockBuilder);
+
+        // Assert
+        assertTrue(result);
+        verify(mockBuilder).value(eq(null), any(byte[].class));
+        verify(mockS3Client, never()).putObject(any(PutObjectRequest.class), any(RequestBody.class));
+    }
+
+    @Test
+    void testHandleSpecificFieldsExtractionMutationWithS3Upload() {
+        initializeHandler(true, "field1,fields2", 100, "test.event", ".s3");
+        // Arrange
+        String largeContent = "{\"field1\":\"" + "a".repeat(200) + "\",\"field2\":\"value2\"}";
+        when(mockDocEvent.type()).thenReturn(DocumentEvent.Type.MUTATION);
+        when(mockDocEvent.content()).thenReturn(largeContent.getBytes());
+        when(mockDocEvent.key()).thenReturn("testKey");
+        when(mockDocEvent.bucket()).thenReturn("testBucket");
+        when(mockDocEvent.revisionSeqno()).thenReturn(123L);
+        // when(mockParams.documentEvent()).thenReturn(mockDocEvent);
+        handler.setS3Client(mockS3Client);
+        // Act
+        boolean result = handler.handleSpecificFieldsExtractionMutation(mockDocEvent, DocumentEvent.Type.MUTATION,
+                mockParams, mockBuilder);
+
+        // Assert
+        assertTrue(result);
+        verify(mockBuilder).value(eq(null), any(byte[].class));
+        verify(mockS3Client).putObject(any(PutObjectRequest.class), any(RequestBody.class));
+    }
+
+    @Test
+    void testHandleSpecificFieldsExtractionMutationWithInvalidJson() {
+        initializeHandler(true, "field1,fields2", 100, "test.event", ".s3");
+        // Arrange
+        when(mockDocEvent.content()).thenReturn("invalid json".getBytes());
+        handler.setS3Client(mockS3Client);
+        // Act
+        boolean result = handler.handleSpecificFieldsExtractionMutation(mockDocEvent, DocumentEvent.Type.MUTATION,
+                mockParams, mockBuilder);
+
+        // Assert
+        assertFalse(result);
+        verify(mockBuilder, never()).value(any(), any());
+        verify(mockS3Client, never()).putObject(any(PutObjectRequest.class), any(RequestBody.class));
     }
 }
