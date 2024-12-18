@@ -309,4 +309,42 @@ class NDSourceHandlerTest {
         verify(mockBuilder, never()).value(any(), any());
         verify(mockS3Client, never()).putObject(any(PutObjectRequest.class), any(RequestBody.class));
     }
+
+    @Test
+    void testGenerateS3Key() {
+        // Arrange
+        String originalKey = "MDucot5/qbti~240924115010829";
+        long revisionSeqno = 123L;
+        byte[] content = "{\"documents\":{\"1\":{\"docProps\":{\"id\":\"doc123\"}}}}".getBytes();
+
+        when(mockEvent.key()).thenReturn(originalKey);
+        when(mockEvent.revisionSeqno()).thenReturn(revisionSeqno);
+        when(mockEvent.content()).thenReturn(content);
+
+        // Act
+        String result = handler.generateS3Key(mockEvent);
+
+        // Assert
+        String expectedKey = "MDucot5/q/b/t/i/~240924115010829/doc123/123.json";
+        assertEquals(expectedKey, result);
+    }
+
+    @Test
+    void testGenerateS3KeyForNonDocumentEvent() {
+        // Arrange
+        String originalKey = "shortKey";
+        long revisionSeqno = 456L;
+        byte[] content = "{}".getBytes();
+
+        when(mockEvent.key()).thenReturn(originalKey);
+        when(mockEvent.revisionSeqno()).thenReturn(revisionSeqno);
+        when(mockEvent.content()).thenReturn(content);
+
+        // Act
+        String result = handler.generateS3Key(mockEvent);
+
+        // Assert
+        String expectedKey = "directory/shortKey/456.json";
+        assertEquals(expectedKey, result);
+    }
 }
