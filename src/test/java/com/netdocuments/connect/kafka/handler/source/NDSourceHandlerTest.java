@@ -62,15 +62,11 @@ class NDSourceHandlerTest {
         lenient().when(mockParams.topic()).thenReturn("test-topic");
     }
 
-    private void initializeHandler(boolean enableS3, String fields, long threshold, String eventType, String suffix) {
-        initializeHandler(enableS3, fields, threshold, eventType, suffix, null, null);
-    }
-
     private void initializeHandler(boolean enableS3, String fields, long threshold, String eventType, String suffix,
-            String filterField, String filterValues) {
+            String filterField, String filterValues, boolean filterAllowNull) {
         Map<String, String> props = new HashMap<>();
         props.put("couchbase.custom.handler.nd.fields", fields);
-        props.put("couchbase.custom.handler.nd.cloud.event.type", eventType);
+        props.put("couchbase.custom.handler.nd.cloudevent.type", eventType);
 
         if (enableS3) {
             props.put("couchbase.custom.handler.nd.s3.bucket", "test-bucket");
@@ -85,8 +81,20 @@ class NDSourceHandlerTest {
         if (filterValues != null) {
             props.put("couchbase.custom.handler.nd.filter.values", filterValues);
         }
+        props.put("couchbase.custom.handler.nd.filter.allow.null", String.valueOf(filterAllowNull));
 
         handler.init(props);
+    }
+
+    // Add an overloaded version of initializeHandler for backward compatibility
+    private void initializeHandler(boolean enableS3, String fields, long threshold, String eventType, String suffix,
+            String filterField, String filterValues) {
+        initializeHandler(enableS3, fields, threshold, eventType, suffix, filterField, filterValues, false);
+    }
+
+    // Add another overload for the simplest case
+    private void initializeHandler(boolean enableS3, String fields, long threshold, String eventType, String suffix) {
+        initializeHandler(enableS3, fields, threshold, eventType, suffix, null, null, false);
     }
 
     @Test
@@ -498,5 +506,71 @@ class NDSourceHandlerTest {
         assertNotNull(data.get("field1"));
         assertNotNull(data.get("field2"));
         assertNotNull(data.get("type"));
+    }
+
+    @Test
+    void testHandleMutationWithNullFieldValueAllowed() throws Exception {
+        // Initialize with field filtering and allow null values
+        initializeHandler(true, "field1,field2", 100000, "test.event", ".json", "field1", "value1", true);
+        String content = "{\"field2\":\"value2\"}"; // field1 is missing/null
+        setupMockEvent(DocumentEvent.Type.MUTATION, "MDucot5/qbti~240924115010829", content, "test-bucket");
+
+        SourceHandlerParams params = new SourceHandlerParams(mockEvent, "test-topic", false);
+        SourceRecordBuilder result = handler.handle(params);
+
+        assertNotNull(result);
+        assertEquals("MDucot5/qbti~240924115010829", result.key());
+
+        JsonNode jsonNode = objectMapper.readTree((byte[]) result.value());
+        JsonNode data = jsonNode.get("data");
+        assertNull(data.get("field1"));
+        assertEquals("value2", data.get("field2").asText());
+    }
+
+    @Test
+    void testHandleMutationWithNullFieldValueNotAllowed() throws Exception {
+        // Initialize with field filtering and don't allow null values
+        initializeHandler(true, "field1,field2", 100000, "test.event", ".json", "field1", "value1", false);
+        String content = "{\"field2\":\"value2\"}"; // field1 is missing/null
+        setupMockEvent(DocumentEvent.Type.MUTATION, "MDucot5/qbti~240924115010829", content, "test-bucket");
+
+        SourceHandlerParams params = new SourceHandlerParams(mockEvent, "test-topic", false);
+        SourceRecordBuilder result = handler.handle(params);
+
+        assertNull(result);
+    }
+
+    @Test
+    void testHandleMutationWithExplicitNullFieldValueAllowed() throws Exception {
+        // Initialize with field filtering and allow null values
+        initializeHandler(true, "field1,field2", 100000, "test.event", ".json", "field1", "value1", true);
+        String content = "{\"field1\": null, \"field2\":\"value2\"}"; // field1 is explicitly null
+        setupMockEvent(DocumentEvent.Type.MUTATION, "MDucot5/qbti~240924115010829", content, "test-bucket");
+
+        SourceHandlerParams params = new SourceHandlerParams(mockEvent, "test-topic", false);
+        SourceRecordBuilder result = handler.handle(params);
+
+        assertNotNull(result, "Result should not be null when null values are allowed");
+        assertEquals("MDucot5/qbti~240924115010829", result.key());
+
+        JsonNode jsonNode = objectMapper.readTree((byte[]) result.value());
+        JsonNode data = jsonNode.get("data");
+        assertEquals("value2", data.get("field2").asText());
+        // field1 should not be present in the output, as null is treated the same as
+        // missing
+        assertFalse(data.has("field1"), "field1 should not exist in the result when null");
+    }
+
+    @Test
+    void testHandleMutationWithExplicitNullFieldValueNotAllowed() throws Exception {
+        // Initialize with field filtering and don't allow null values
+        initializeHandler(true, "field1,field2", 100000, "test.event", ".json", "field1", "value1", false);
+        String content = "{\"field1\": null, \"field2\":\"value2\"}"; // field1 is explicitly null
+        setupMockEvent(DocumentEvent.Type.MUTATION, "MDucot5/qbti~240924115010829", content, "test-bucket");
+
+        SourceHandlerParams params = new SourceHandlerParams(mockEvent, "test-topic", false);
+        SourceRecordBuilder result = handler.handle(params);
+
+        assertNull(result);
     }
 }

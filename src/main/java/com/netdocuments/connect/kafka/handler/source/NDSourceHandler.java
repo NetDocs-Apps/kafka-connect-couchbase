@@ -23,6 +23,7 @@ import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
 
+import com.couchbase.client.core.deps.com.fasterxml.jackson.databind.JsonNode;
 import com.couchbase.client.core.deps.com.fasterxml.jackson.databind.ObjectMapper;
 import com.couchbase.connect.kafka.handler.source.DocumentEvent;
 import com.couchbase.connect.kafka.handler.source.RawJsonWithMetadataSourceHandler;
@@ -63,6 +64,7 @@ public class NDSourceHandler extends RawJsonWithMetadataSourceHandler {
   private static final String S3_SUFFIX_CONFIG = "couchbase.custom.handler.nd.s3.suffix";
   private static final String FILTER_FIELD_CONFIG = "couchbase.custom.handler.nd.filter.field";
   private static final String FILTER_VALUES_CONFIG = "couchbase.custom.handler.nd.filter.values";
+  private static final String FILTER_ALLOW_NULL_CONFIG = "couchbase.custom.handler.nd.filter.allow.null";
 
   // Configuration definition
   private static final ConfigDef CONFIG_DEF = new ConfigDef()
@@ -84,7 +86,9 @@ public class NDSourceHandler extends RawJsonWithMetadataSourceHandler {
       .define(FILTER_FIELD_CONFIG, ConfigDef.Type.STRING, null, ConfigDef.Importance.MEDIUM,
           "JSON path to the field used for filtering (e.g., 'documents.1.docProps.type')")
       .define(FILTER_VALUES_CONFIG, ConfigDef.Type.STRING, null, ConfigDef.Importance.MEDIUM,
-          "Comma-separated list of values to filter on");
+          "Comma-separated list of values to filter on")
+      .define(FILTER_ALLOW_NULL_CONFIG, ConfigDef.Type.BOOLEAN, false, ConfigDef.Importance.MEDIUM,
+          "If true, documents with null values for the filter field will pass the filter");
 
   private List<String> fields;
   private S3Client s3Client;
@@ -96,6 +100,7 @@ public class NDSourceHandler extends RawJsonWithMetadataSourceHandler {
   private String s3Suffix;
   private String filterField;
   private Set<String> filterValues;
+  private boolean filterAllowNull;
   private static final String DOC_PROPS_ID_FIELD = "documents.1.docProps.id";
   private Map<String, Object> extractedFields;
 
@@ -114,6 +119,13 @@ public class NDSourceHandler extends RawJsonWithMetadataSourceHandler {
       extractedFields = JsonPropertyExtractor.extract(
           new ByteArrayInputStream(content),
           allFields.toArray(new String[0]));
+
+      // Add debug logging
+      LOGGER.info("Extracted fields: {}", extractedFields);
+      if (filterField != null) {
+        LOGGER.info("Filter field '{}' value: {}", filterField, extractedFields.get(filterField));
+      }
+
       return extractedFields;
     } catch (Exception e) {
       LOGGER.error("Error while extracting fields from document", e);
@@ -127,26 +139,34 @@ public class NDSourceHandler extends RawJsonWithMetadataSourceHandler {
     }
     Object fieldValue = extractedFields.get(filterField);
     String docId = extractDocPropsId();
-    if (fieldValue == null) {
-      LOGGER.info("Field value is null for {}, filtering", docId);
-      return false;
+
+    // Handle both missing fields and explicit null values
+    if (fieldValue == null || (fieldValue instanceof JsonNode && ((JsonNode) fieldValue).isNull())) {
+      LOGGER.info("Field value is null for {} (filterAllowNull={})", docId, filterAllowNull);
+      return filterAllowNull;
     }
-    LOGGER.info("Field value is '{}' for {}", fieldValue.toString(), docId);
+
+    LOGGER.info("Field value is '{}' for {} (type: {})",
+        fieldValue.toString(),
+        docId,
+        fieldValue.getClass().getName());
 
     if (fieldValue instanceof String) {
-      LOGGER.info("Passing");
-      return filterValues.contains(fieldValue);
+      boolean contains = filterValues.contains(fieldValue);
+      LOGGER.info("String value match: {}", contains);
+      return contains;
     } else if (fieldValue instanceof List) {
       @SuppressWarnings("unchecked")
       List<String> values = (List<String>) fieldValue;
       if (values.size() == 1) {
-        LOGGER.info("Passing");
-        return filterValues.contains(values.get(0));
+        boolean contains = filterValues.contains(values.get(0));
+        LOGGER.info("List value match: {}", contains);
+        return contains;
       }
     } else {
-      LOGGER.info("Field value of type: {} ", fieldValue.getClass().getName());
+      LOGGER.info("Unhandled field value type: {} ", fieldValue.getClass().getName());
     }
-    LOGGER.info("Filtering");
+    LOGGER.info("Filtering out document");
     return false;
   }
 
@@ -173,6 +193,7 @@ public class NDSourceHandler extends RawJsonWithMetadataSourceHandler {
     filterValues = filterValuesStr != null && !filterValuesStr.isEmpty()
         ? new HashSet<>(Arrays.asList(filterValuesStr.split(",")))
         : null;
+    filterAllowNull = config.getBoolean(FILTER_ALLOW_NULL_CONFIG);
 
     if (filterField != null && !filterField.isEmpty() && filterValues != null && !filterValues.isEmpty()) {
       LOGGER.info("Initialized value filtering with field '{}' and values: {}", filterField, filterValues);
