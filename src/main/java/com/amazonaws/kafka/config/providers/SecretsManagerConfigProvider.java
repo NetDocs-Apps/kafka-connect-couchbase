@@ -150,7 +150,7 @@ public class SecretsManagerConfigProvider extends AwsServiceConfigProvider {
             String value = response.secretString();
 
             try {
-                secretJson = new ObjectMapper().readValue(value, new TypeReference<>() {
+                secretJson = new ObjectMapper().readValue(value, new TypeReference<Map<String, String>>() {
                 });
             } catch (Exception e) {
                 log.error("Unexpected value of a secret's structure", e);

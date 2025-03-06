@@ -20,7 +20,6 @@ import com.couchbase.client.core.annotation.Stability;
 import com.couchbase.connect.kafka.StreamFrom;
 import com.couchbase.connect.kafka.filter.Filter;
 import com.couchbase.connect.kafka.handler.source.CouchbaseHeaderSetter;
-import com.couchbase.connect.kafka.handler.source.SourceHandler;
 import com.couchbase.connect.kafka.util.TopicMap;
 import com.couchbase.connect.kafka.util.config.annotation.Default;
 import org.apache.kafka.common.config.ConfigDef;
@@ -71,14 +70,17 @@ public interface SourceBehaviorConfig {
 
   /**
    * The fully-qualified class name of the source handler to use.
-   * The source handler determines how the Couchbase document is converted into a Kafka record.
+   * The source handler determines how the Couchbase document is converted into a
+   * Kafka record.
    * <p>
-   * The class must implement either `com.couchbase.connect.kafka.handler.source.SourceHandler`
+   * The class must implement either
+   * `com.couchbase.connect.kafka.handler.source.SourceHandler`
    * or `com.couchbase.connect.kafka.handler.source.MultiSourceHandler`.
    * <p>
    * To publish JSON messages identical to the Couchbase documents, use
    * `com.couchbase.connect.kafka.handler.source.RawJsonSourceHandler`
-   * and set `value.converter` to `org.apache.kafka.connect.converters.ByteArrayConverter`.
+   * and set `value.converter` to
+   * `org.apache.kafka.connect.converters.ByteArrayConverter`.
    * <p>
    * When using a custom source handler that filters out certain messages,
    * consider also configuring `couchbase.black.hole.topic`.
@@ -98,20 +100,24 @@ public interface SourceBehaviorConfig {
    * <p>
    * - *`key`* - The Couchbase document ID.
    * <p>
-   * - *`qualifiedKey`* - The document's scope, collection, and document ID, delimited by dots.
+   * - *`qualifiedKey`* - The document's scope, collection, and document ID,
+   * delimited by dots.
    * Example: `myScope.myCollection.myDocumentId`
    * <p>
    * - *`cas`* - The document's "compare and swap" value.
    * <p>
-   * - *`partition`* - The index of the Couchbase partition the document came from.
+   * - *`partition`* - The index of the Couchbase partition the document came
+   * from.
    * <p>
-   * - *`partitionUuid`* - Identifies the history branch of the partition the document came from.
+   * - *`partitionUuid`* - Identifies the history branch of the partition the
+   * document came from.
    * <p>
    * - *`seqno`* - The DCP sequence number of the event.
    * <p>
    * - *`rev`* - The revision number of the event.
    * <p>
-   * - *`expiry`* - The epoch second when the document expires, or null if the document has no expiry (or if the event is a deletion).
+   * - *`expiry`* - The epoch second when the document expires, or null if the
+   * document has no expiry (or if the event is a deletion).
    *
    * @since 4.2.5
    */
@@ -120,7 +126,8 @@ public interface SourceBehaviorConfig {
   List<String> headers();
 
   static ConfigDef.Validator headersValidator() {
-    return validate((List<String> headers) -> new CouchbaseHeaderSetter("somePrefix", headers), "Zero or more of " + CouchbaseHeaderSetter.validHeaders());
+    return validate((List<String> headers) -> new CouchbaseHeaderSetter("somePrefix", headers),
+        "Zero or more of " + CouchbaseHeaderSetter.validHeaders());
   }
 
   /**
@@ -129,7 +136,8 @@ public interface SourceBehaviorConfig {
    * <p>
    * For example, if `couchbase.headers` is set to `bucket,qualifiedKey`
    * and `header.name.prefix` is set to `example.`
-   * then records will have headers named `example.bucket` and `example.qualifiedKey`.
+   * then records will have headers named `example.bucket` and
+   * `example.qualifiedKey`.
    *
    * @since 4.2.5
    */
@@ -152,12 +160,14 @@ public interface SourceBehaviorConfig {
   Class<? extends Filter> eventFilter();
 
   /**
-   * If this property is non-blank, the connector publishes a tiny synthetic record
+   * If this property is non-blank, the connector publishes a tiny synthetic
+   * record
    * to this topic whenever the Filter or SourceHandler ignores a source event.
    * <p>
    * This lets the connector tell the Kafka Connect framework about the
    * source offset of the ignored event. Otherwise, a long sequence of ignored
-   * events in a low-traffic deployment might cause the stored source offset to lag
+   * events in a low-traffic deployment might cause the stored source offset to
+   * lag
    * too far behind the current source offset, which can lead to rollbacks to zero
    * when the connector is restarted.
    * <p>
@@ -171,11 +181,14 @@ public interface SourceBehaviorConfig {
   String blackHoleTopic();
 
   /**
-   * If `couchbase.stream.from` is `SAVED_OFFSET_OR_NOW`, and this property is non-blank,
-   * on startup the connector publishes to the named topic one tiny synthetic record
+   * If `couchbase.stream.from` is `SAVED_OFFSET_OR_NOW`, and this property is
+   * non-blank,
+   * on startup the connector publishes to the named topic one tiny synthetic
+   * record
    * for each source partition that does not yet have a saved offset.
    * <p>
-   * This lets the connector initialize the missing source offsets to "now" (the current
+   * This lets the connector initialize the missing source offsets to "now" (the
+   * current
    * state of Couchbase).
    * <p>
    * The synthetic records have a value of null, and the same key:
@@ -183,7 +196,8 @@ public interface SourceBehaviorConfig {
    * <p>
    * Consumers of this topic must ignore (or tolerate) these records.
    * <p>
-   * If you specify a value for `couchbase.black.hole.topic`, specify the same value here.
+   * If you specify a value for `couchbase.black.hole.topic`, specify the same
+   * value here.
    *
    * @since 4.2.4
    */
@@ -199,7 +213,8 @@ public interface SourceBehaviorConfig {
 
   /**
    * If true, Couchbase Server will omit the document content when telling the
-   * connector about a change. The document key and metadata will still be present.
+   * connector about a change. The document key and metadata will still be
+   * present.
    * <p>
    * If you don't care about the content of changed documents, enabling
    * this option is a great way to reduce the connector's network bandwidth
@@ -228,7 +243,8 @@ public interface SourceBehaviorConfig {
   StreamFrom streamFrom();
 
   /**
-   * If you wish to stream from all collections within a scope, specify the scope name here.
+   * If you wish to stream from all collections within a scope, specify the scope
+   * name here.
    * <p>
    * If you specify neither "couchbase.scope" nor "couchbase.collections",
    * the connector will stream from all collections of all scopes in the bucket.
@@ -239,7 +255,8 @@ public interface SourceBehaviorConfig {
   String scope();
 
   /**
-   * If you wish to stream from specific collections, specify the qualified collection
+   * If you wish to stream from specific collections, specify the qualified
+   * collection
    * names here, separated by commas. A qualified name is the name of the scope
    * followed by a dot (.) and then the name of the collection. For example:
    * "tenant-foo.invoices".

@@ -61,6 +61,8 @@ public class NDSourceHandler extends RawJsonWithMetadataSourceHandler {
   private static final String S3_THRESHOLD_CONFIG = "couchbase.custom.handler.nd.s3.threshold";
   private static final String CLOUD_EVENT_TYPE_CONFIG = "couchbase.custom.handler.nd.cloudevent.type";
   private static final String S3_SUFFIX_CONFIG = "couchbase.custom.handler.nd.s3.suffix";
+  private static final String FILTER_FIELD_CONFIG = "couchbase.custom.handler.nd.filter.field";
+  private static final String FILTER_VALUES_CONFIG = "couchbase.custom.handler.nd.filter.values";
 
   // Configuration definition
   private static final ConfigDef CONFIG_DEF = new ConfigDef()
@@ -78,7 +80,11 @@ public class NDSourceHandler extends RawJsonWithMetadataSourceHandler {
           ConfigDef.Importance.MEDIUM,
           "The type of message that will be listed on cloud event")
       .define(S3_SUFFIX_CONFIG, ConfigDef.Type.STRING, ".S3", ConfigDef.Importance.LOW,
-          "The suffix to append to S3 keys for uploaded messages");
+          "The suffix to append to S3 keys for uploaded messages")
+      .define(FILTER_FIELD_CONFIG, ConfigDef.Type.STRING, null, ConfigDef.Importance.MEDIUM,
+          "JSON path to the field used for filtering (e.g., 'documents.1.docProps.type')")
+      .define(FILTER_VALUES_CONFIG, ConfigDef.Type.STRING, null, ConfigDef.Importance.MEDIUM,
+          "Comma-separated list of values to filter on");
 
   private List<String> fields;
   private S3Client s3Client;
@@ -88,6 +94,66 @@ public class NDSourceHandler extends RawJsonWithMetadataSourceHandler {
   private long s3Threshold;
   private String cloudEventType;
   private String s3Suffix;
+  private String filterField;
+  private Set<String> filterValues;
+  private static final String DOC_PROPS_ID_FIELD = "documents.1.docProps.id";
+  private Map<String, Object> extractedFields;
+
+  private Set<String> getAllFieldsToExtract() {
+    Set<String> allFields = new HashSet<>(fields);
+    if (filterField != null && !filterField.isEmpty()) {
+      allFields.add(filterField);
+    }
+    allFields.add(DOC_PROPS_ID_FIELD);
+    return allFields;
+  }
+
+  Map<String, Object> extractFields(byte[] content) {
+    try {
+      Set<String> allFields = getAllFieldsToExtract();
+      extractedFields = JsonPropertyExtractor.extract(
+          new ByteArrayInputStream(content),
+          allFields.toArray(new String[0]));
+      return extractedFields;
+    } catch (Exception e) {
+      LOGGER.error("Error while extracting fields from document", e);
+      return new HashMap<>();
+    }
+  }
+
+  private boolean passesValueFilter() {
+    if (filterField == null || filterField.isEmpty() || filterValues == null || filterValues.isEmpty()) {
+      return true;
+    }
+    Object fieldValue = extractedFields.get(filterField);
+    String docId = extractDocPropsId();
+    if (fieldValue == null) {
+      LOGGER.info("Field value is null for {}, filtering", docId);
+      return false;
+    }
+    LOGGER.info("Field value is '{}' for {}", fieldValue.toString(), docId);
+
+    if (fieldValue instanceof String) {
+      LOGGER.info("Passing");
+      return filterValues.contains(fieldValue);
+    } else if (fieldValue instanceof List) {
+      @SuppressWarnings("unchecked")
+      List<String> values = (List<String>) fieldValue;
+      if (values.size() == 1) {
+        LOGGER.info("Passing");
+        return filterValues.contains(values.get(0));
+      }
+    } else {
+      LOGGER.info("Field value of type: {} ", fieldValue.getClass().getName());
+    }
+    LOGGER.info("Filtering");
+    return false;
+  }
+
+  String extractDocPropsId() {
+    Object value = extractedFields.get(DOC_PROPS_ID_FIELD);
+    return value instanceof String ? (String) value : "unknown";
+  }
 
   /**
    * Initializes the handler with the given configuration properties.
@@ -102,6 +168,15 @@ public class NDSourceHandler extends RawJsonWithMetadataSourceHandler {
 
     initializeHandlerProperties(config);
     initializeS3Client(config);
+    filterField = config.getString(FILTER_FIELD_CONFIG);
+    String filterValuesStr = config.getString(FILTER_VALUES_CONFIG);
+    filterValues = filterValuesStr != null && !filterValuesStr.isEmpty()
+        ? new HashSet<>(Arrays.asList(filterValuesStr.split(",")))
+        : null;
+
+    if (filterField != null && !filterField.isEmpty() && filterValues != null && !filterValues.isEmpty()) {
+      LOGGER.info("Initialized value filtering with field '{}' and values: {}", filterField, filterValues);
+    }
   }
 
   /**
@@ -109,8 +184,11 @@ public class NDSourceHandler extends RawJsonWithMetadataSourceHandler {
    * CloudEvent settings.
    */
   private void initializeHandlerProperties(AbstractConfig config) {
-    // Initialize fields
+    // Initialize fields with a default of "*" if not provided
     fields = config.getList(FIELDS_CONFIG);
+    if (fields == null || fields.isEmpty()) {
+      fields = Collections.singletonList("*");
+    }
 
     // Initialize CloudEvent type
     cloudEventType = config.getString(CLOUD_EVENT_TYPE_CONFIG);
@@ -202,6 +280,16 @@ public class NDSourceHandler extends RawJsonWithMetadataSourceHandler {
         LOGGER.warn("Skipping non-JSON document: bucket={} key={}", docEvent.bucket(), docEvent.qualifiedKey());
         return false;
       }
+
+      // Extract all fields once
+      extractedFields = extractFields(docEvent.content());
+
+      // Apply value filtering before proceeding
+      if (!passesValueFilter()) {
+        LOGGER.debug("Document filtered out based on field {} values", filterField);
+        return false;
+      }
+
       if (fields.size() == 1 && fields.get(0).equals("*")) {
         return handleFullDocumentMutation(docEvent, params, builder);
       }
@@ -284,39 +372,14 @@ public class NDSourceHandler extends RawJsonWithMetadataSourceHandler {
     String originalKey = docEvent.key();
     long revisionSeqno = docEvent.revisionSeqno();
 
-    // Extract the 'documents.1.docProps.id' field value from the document content
-    String docPropsId = extractDocPropsId(docEvent.content());
-
-    // Modify the key to add '/' after each of the next four letters after the
-    // existing '/'
+    String docPropsId = extractDocPropsId();
     String modifiedKey = modifyKey(originalKey);
 
-    // Not a document
     if (modifiedKey == originalKey && (docPropsId == null || docPropsId.equals("unknown"))) {
       return generateS3KeyForDirectory(docEvent);
     }
 
-    // Combine modified key, docProps.id, and revision sequence number to form the
-    // S3 key
     return String.format("%s/%s/%d.json", modifiedKey, docPropsId, revisionSeqno);
-  }
-
-  /**
-   * Extracts the 'documents.1.docProps.id' field value from the document content.
-   *
-   * @param content The byte array containing the document content
-   * @return The extracted docProps.id value, or "unknown" if extraction fails
-   */
-  String extractDocPropsId(byte[] content) {
-    try {
-      Map<String, Object> extracted = JsonPropertyExtractor.extract(
-          new ByteArrayInputStream(content),
-          new String[] { "documents.1.docProps.id" });
-      return (String) extracted.get("documents.1.docProps.id");
-    } catch (Exception e) {
-      LOGGER.error("Failed to extract docProps.id", e);
-      return "unknown";
-    }
   }
 
   /**
@@ -344,10 +407,7 @@ public class NDSourceHandler extends RawJsonWithMetadataSourceHandler {
    */
   boolean handleSpecificFieldsExtractionMutation(DocumentEvent docEvent, DocumentEvent.Type type,
       SourceHandlerParams params, SourceRecordBuilder builder) {
-    final byte[] content = docEvent.content();
-    final Map<String, Object> newValue;
-
-    newValue = createMutationValue(docEvent, content);
+    final Map<String, Object> newValue = createMutationValue(docEvent);
     if (newValue == null) {
       return false;
     }
@@ -383,17 +443,21 @@ public class NDSourceHandler extends RawJsonWithMetadataSourceHandler {
   /**
    * Creates a value map for mutation events, extracting specified fields.
    */
-  private Map<String, Object> createMutationValue(DocumentEvent docEvent, byte[] content) {
-    try {
-      Map<String, Object> newValue = JsonPropertyExtractor.extract(new ByteArrayInputStream(content),
-          fields.toArray(new String[fields.size()]));
-      newValue.put("event", DocumentEvent.Type.MUTATION.schemaName());
-      newValue.put("key", docEvent.key());
-      return newValue;
-    } catch (Exception e) {
-      LOGGER.error("Error while extracting fields from document", e);
+  private Map<String, Object> createMutationValue(DocumentEvent docEvent) {
+    if (extractedFields == null || extractedFields.isEmpty()) {
       return null;
     }
+
+    Map<String, Object> newValue = new HashMap<>();
+    for (String field : fields) {
+      Object value = extractedFields.get(field);
+      if (value != null) {
+        newValue.put(field, value);
+      }
+    }
+    newValue.put("event", DocumentEvent.Type.MUTATION.schemaName());
+    newValue.put("key", docEvent.key());
+    return newValue;
   }
 
   /**
