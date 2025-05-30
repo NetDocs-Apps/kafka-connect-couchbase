@@ -16,6 +16,7 @@
 
 package com.couchbase.connect.kafka;
 
+import com.couchbase.client.core.env.CouchbaseThreadFactory;
 import com.couchbase.client.core.logging.LogRedaction;
 import com.couchbase.client.core.util.NanoTimestamp;
 import com.couchbase.client.dcp.core.logging.RedactionLevel;
@@ -33,11 +34,19 @@ import com.couchbase.connect.kafka.handler.source.SourceHandler;
 import com.couchbase.connect.kafka.handler.source.SourceHandlerParams;
 import com.couchbase.connect.kafka.handler.source.SourceRecordBuilder;
 import com.couchbase.connect.kafka.util.ConnectHelper;
+import com.couchbase.connect.kafka.util.FirstCallTracker;
+import com.couchbase.connect.kafka.util.config.LookupTable;
 import com.couchbase.connect.kafka.util.ScopeAndCollection;
 import com.couchbase.connect.kafka.util.TopicMap;
 import com.couchbase.connect.kafka.util.Version;
 import com.couchbase.connect.kafka.util.Watchdog;
 import com.couchbase.connect.kafka.util.config.ConfigHelper;
+import com.jayway.jsonpath.Configuration;
+import com.jayway.jsonpath.InvalidJsonException;
+import com.jayway.jsonpath.JsonPath;
+import com.jayway.jsonpath.Option;
+import com.jayway.jsonpath.spi.json.JacksonJsonProvider;
+import com.jayway.jsonpath.spi.mapper.JacksonMappingProvider;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
@@ -56,6 +65,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import javax.management.ObjectName;
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -69,7 +80,9 @@ import java.util.Set;
 import java.util.SortedMap;
 import java.util.TreeMap;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadFactory;
 
 import static com.couchbase.client.core.util.CbStrings.emptyToNull;
 import static com.couchbase.client.core.util.CbStrings.isNullOrEmpty;
@@ -79,20 +92,39 @@ import static java.util.Collections.emptyList;
 import static java.util.Collections.singletonList;
 import static java.util.Collections.unmodifiableMap;
 import static java.util.Objects.requireNonNull;
+import static java.util.Objects.requireNonNull;
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static java.util.concurrent.TimeUnit.SECONDS;
 
 public class CouchbaseSourceTask extends SourceTask {
   private static final Logger LOGGER = LoggerFactory.getLogger(CouchbaseSourceTask.class);
   private static final long STOP_TIMEOUT_MILLIS = SECONDS.toMillis(10);
 
+  private static final ThreadFactory cleanupThreadFactory = new CouchbaseThreadFactory("cb-source-task-cleanup-");
+
   private String connectorName;
-  private CouchbaseReader couchbaseReader;
+  private volatile CouchbaseReader couchbaseReader; // volatile because non-final and referenced by cleanup thread
   private BlockingQueue<DocumentChange> queue;
   private BlockingQueue<Throwable> errorQueue;
-  private String defaultTopicTemplate;
-  private Map<ScopeAndCollection, String> collectionToTopic;
+  private LookupTable<ScopeAndCollection, String> topicTemplate;
   private String bucket;
   private Filter filter;
+
+  private LookupTable<ScopeAndCollection, JsonPath> jsonPaths;
+  private static final JsonPath ROOT_JSON_PATH = JsonPath.compile("$");
+
+  public static JsonPath parseJsonpath(String s) {
+    return s.isEmpty() || s.equals("$") ? ROOT_JSON_PATH : JsonPath.compile(s);
+  }
+
+  private static final Configuration jsonpathConf = Configuration.builder()
+      .jsonProvider(new JacksonJsonProvider())
+      .mappingProvider(new JacksonMappingProvider())
+      .options(
+          Option.AS_PATH_LIST,
+          Option.SUPPRESS_EXCEPTIONS)
+      .build();
+
   private boolean filterIsNoop;
   private MultiSourceHandler sourceHandler;
   private CouchbaseHeaderSetter headerSetter;
@@ -101,7 +133,7 @@ public class CouchbaseSourceTask extends SourceTask {
   private boolean noValue;
   private SourceDocumentLifecycle lifecycle;
 
-  private MeterRegistry meterRegistry;
+  private volatile MeterRegistry meterRegistry; // volatile because non-final and referenced by cleanup thread
   private Counter filteredCounter;
   private Timer handlerTimer;
   private Timer filterTimer;
@@ -110,11 +142,25 @@ public class CouchbaseSourceTask extends SourceTask {
 
   private final Watchdog watchdog = new Watchdog();
 
+  // Guard against race condition where the framework calls stop() before start()
+  // is complete,
+  // which could happen prior to the fix for
+  // https://issues.apache.org/jira/browse/KAFKA-10792
+  private final CountDownLatch startupComplete = new CountDownLatch(1);
+
   @SuppressWarnings("OptionalUsedAsFieldOrParameterType")
   private Optional<String> blackHoleTopic;
-  private Optional<String> intialOffsetTopic;
+  private Optional<String> initialOffsetTopic;
 
   private final SourceTaskLifecycle taskLifecycle = new SourceTaskLifecycle();
+  private final Watchdog watchdog = new Watchdog(taskLifecycle.taskUuid());
+
+  private final FirstCallTracker start = new FirstCallTracker();
+  private final FirstCallTracker cleanup = new FirstCallTracker();
+
+  private String taskUuid() {
+    return taskLifecycle.taskUuid();
+  }
 
   @Override
   public String version() {
@@ -135,79 +181,103 @@ public class CouchbaseSourceTask extends SourceTask {
 
   @Override
   public void start(Map<String, String> properties) {
-    watchdog.start();
-
-    this.connectorName = properties.get("name");
-
-    CouchbaseSourceTaskConfig config;
-    try {
-      config = ConfigHelper.parse(CouchbaseSourceTaskConfig.class, properties);
-      if (isNullOrEmpty(connectorName)) {
-        throw new ConfigException("Connector must have a non-blank 'name' config property.");
-      }
-    } catch (ConfigException e) {
-      throw new ConnectException("Couldn't start CouchbaseSourceTask due to configuration error", e);
+    if (start.alreadyCalled()) {
+      throw new IllegalStateException(
+          "This source task's start() method has already been called; this violates an important assumption about how the Kafka Connect framework manages the SourceTask lifecycle. taskUuid="
+              + taskUuid());
     }
 
-    this.meterRegistry = newMeterRegistry(connectorName, config);
-    this.handlerTimer = meterRegistry.timer("handler");
-    this.filterTimer = meterRegistry.timer("filter");
-    this.filteredCounter = meterRegistry.counter("filtered.out");
-    this.timeBetweenPollsTimer = meterRegistry.timer("time.between.polls");
+    try {
+      watchdog.start();
 
-    LogRedaction.setRedactionLevel(config.logRedaction());
-    RedactionLevel.set(toDcp(config.logRedaction()));
+      this.connectorName = properties.get("name");
 
-    Map<String, String> unmodifiableProperties = unmodifiableMap(properties);
+      CouchbaseSourceTaskConfig config;
+      try {
+        config = ConfigHelper.parse(CouchbaseSourceTaskConfig.class, properties);
+        if (isNullOrEmpty(connectorName)) {
+          throw new ConfigException("Connector must have a non-blank 'name' config property.");
+        }
+      } catch (ConfigException e) {
+        throw new ConnectException("Couldn't start CouchbaseSourceTask due to configuration error", e);
+      }
 
-    lifecycle = SourceDocumentLifecycle.create(config);
+      String taskNumber = ConnectHelper.getTaskIdFromLoggingContext().orElse(config.maybeTaskId());
 
-    filter = Utils.newInstance(config.eventFilter());
-    filter.init(unmodifiableProperties);
-    filterIsNoop = filter.getClass().equals(AllPassFilter.class); // not just instanceof, because user could do
-                                                                  // something silly like extend AllPassFilter.
+      this.meterRegistry = newMeterRegistry(connectorName, taskNumber, config);
+      this.handlerTimer = meterRegistry.timer("handler");
+      this.filterTimer = meterRegistry.timer("filter");
+      this.filteredCounter = meterRegistry.counter("filtered.out");
+      this.timeBetweenPollsTimer = meterRegistry.timer("time.between.polls");
 
-    sourceHandler = createSourceHandler(config);
-    sourceHandler.init(unmodifiableProperties);
+      LogRedaction.setRedactionLevel(config.logRedaction());
+      RedactionLevel.set(toDcp(config.logRedaction()));
 
-    headerSetter = new CouchbaseHeaderSetter(config.headerNamePrefix(), config.headers());
+      Map<String, String> unmodifiableProperties = unmodifiableMap(properties);
 
-    blackHoleTopic = Optional.ofNullable(emptyToNull(config.blackHoleTopic().trim()));
-    intialOffsetTopic = Optional.ofNullable(emptyToNull(config.initialOffsetTopic().trim()));
+      lifecycle = SourceDocumentLifecycle.create(taskUuid(), config);
 
-    defaultTopicTemplate = config.topic();
-    collectionToTopic = TopicMap.parseCollectionToTopic(config.collectionToTopic());
-    bucket = config.bucket();
-    // noinspection deprecation
-    connectorNameInOffsets = config.connectorNameInOffsets();
-    batchSizeMax = config.batchSizeMax();
-    noValue = config.noValue();
+      jsonPaths = config.jsonpathFilter()
+          .mapKeys(ScopeAndCollection::parse)
+          .mapValues(CouchbaseSourceTask::parseJsonpath);
 
-    PartitionSet partitionSet = PartitionSet.parse(config.partitions());
-    taskLifecycle.logTaskStarted(connectorName, partitionSet);
+      filter = Utils.newInstance(config.eventFilter());
+      filter.init(unmodifiableProperties);
+      filterIsNoop = filter.getClass().equals(AllPassFilter.class); // not just instanceof, because user could do
+                                                                    // something silly like extend AllPassFilter.
 
-    List<Integer> partitions = partitionSet.toList();
-    Map<Integer, SourceOffset> partitionToSavedSeqno = readSourceOffsets(partitions);
+      sourceHandler = createSourceHandler(config);
+      sourceHandler.init(unmodifiableProperties);
 
-    Set<Integer> partitionsWithoutSavedOffsets = new HashSet<>(partitions);
-    partitionsWithoutSavedOffsets.removeAll(partitionToSavedSeqno.keySet());
+      headerSetter = new CouchbaseHeaderSetter(config.headerNamePrefix(), config.headers());
 
-    taskLifecycle.logSourceOffsetsRead(
-        partitionToSavedSeqno,
-        PartitionSet.from(partitionsWithoutSavedOffsets));
+      blackHoleTopic = Optional.ofNullable(emptyToNull(config.blackHoleTopic().trim()));
+      initialOffsetTopic = Optional.ofNullable(emptyToNull(config.initialOffsetTopic().trim()));
 
-    queue = new LinkedBlockingQueue<>();
-    errorQueue = new LinkedBlockingQueue<>(1);
-    couchbaseReader = new CouchbaseReader(config, connectorName, queue, errorQueue, partitions, partitionToSavedSeqno,
-        lifecycle, meterRegistry, intialOffsetTopic.isPresent(), taskLifecycle);
-    couchbaseReader.start();
+      topicTemplate = config.topic().mapKeys(ScopeAndCollection::parse)
+          .withUnderlay(TopicMap.parseCollectionToTopic(config.collectionToTopic()));
 
-    endOfLastPoll = NanoTimestamp.now();
-    watchdog.enterState("started");
+      bucket = config.bucket();
+      // noinspection deprecation
+      connectorNameInOffsets = config.connectorNameInOffsets();
+      batchSizeMax = config.batchSizeMax();
+      noValue = config.noValue();
+
+      PartitionSet partitionSet = PartitionSet.parse(config.partitions());
+      taskLifecycle.logTaskStarted(connectorName, partitionSet);
+
+      List<Integer> partitions = partitionSet.toList();
+      Map<Integer, SourceOffset> partitionToSavedSeqno = readSourceOffsets(partitions);
+
+      Set<Integer> partitionsWithoutSavedOffsets = new HashSet<>(partitions);
+      partitionsWithoutSavedOffsets.removeAll(partitionToSavedSeqno.keySet());
+
+      taskLifecycle.logSourceOffsetsRead(
+          partitionToSavedSeqno,
+          PartitionSet.from(partitionsWithoutSavedOffsets));
+
+      queue = new LinkedBlockingQueue<>();
+      errorQueue = new LinkedBlockingQueue<>(1);
+      couchbaseReader = new CouchbaseReader(config, connectorName, taskNumber, queue, errorQueue, partitions,
+          partitionToSavedSeqno, lifecycle, meterRegistry, initialOffsetTopic.isPresent(), taskLifecycle);
+      couchbaseReader.start();
+
+      endOfLastPoll = NanoTimestamp.now();
+      watchdog.enterState("started");
+
+    } catch (Exception e) {
+      LOGGER.info("Scheduling cleanup because task failed to start. taskUuid={}", taskUuid(), e);
+      startupComplete.countDown(); // just so cleanup() doesn't complain about stop() being called before start()
+                                   // finishes.
+      cleanup();
+      throw e;
+
+    } finally {
+      startupComplete.countDown();
+    }
   }
 
-  private static MeterRegistry newMeterRegistry(String connectorName, CouchbaseSourceTaskConfig config) {
-    String taskId = ConnectHelper.getTaskIdFromLoggingContext().orElse(config.maybeTaskId());
+  private static MeterRegistry newMeterRegistry(String connectorName, String taskId, CouchbaseSourceTaskConfig config) {
     LinkedHashMap<String, String> commonKeyProperties = new LinkedHashMap<>();
     commonKeyProperties.put("connector", ObjectName.quote(connectorName));
     commonKeyProperties.put("task", taskId);
@@ -260,6 +330,13 @@ public class CouchbaseSourceTask extends SourceTask {
   }
 
   @Override
+  public void stop() {
+    taskLifecycle.logTaskStopped();
+    LOGGER.info("Scheduling cleanup because task was asked to stop. taskUuid={}", taskUuid());
+    cleanup();
+  }
+
+  @Override
   public List<SourceRecord> poll() throws InterruptedException {
     timeBetweenPollsTimer.record(endOfLastPoll.elapsed());
     watchdog.enterState("polling");
@@ -273,7 +350,7 @@ public class CouchbaseSourceTask extends SourceTask {
       // to pause the connector.
       DocumentChange firstEvent = queue.poll(1, SECONDS);
       if (firstEvent == null) {
-        LOGGER.debug("Poll returns 0 results");
+        LOGGER.debug("Poll returns 0 results; taskUuid={}", taskUuid());
         watchdog.enterState("waiting for next poll (after 0 records)");
         return null; // Looks weird, but caller expects it.
       }
@@ -289,10 +366,11 @@ public class CouchbaseSourceTask extends SourceTask {
 
         filteredCounter.increment(results.dropped);
         if (results.synthetic > 0) {
-          LOGGER.info("Poll returns {} result(s) ({} synthetic; filtered out {})",
-              results.published + results.synthetic, results.synthetic, results.dropped);
+          LOGGER.info("Poll returns {} result(s) ({} synthetic; filtered out {}); taskUuid={}",
+              results.published + results.synthetic, results.synthetic, results.dropped, taskUuid());
         } else {
-          LOGGER.info("Poll returns {} result(s) (filtered out {})", results.published, results.dropped);
+          LOGGER.info("Poll returns {} result(s) (filtered out {}); taskUuid={}", results.published, results.dropped,
+              taskUuid());
         }
 
         watchdog.enterState("waiting for next poll (after " + results.records.size() + " records)");
@@ -341,7 +419,7 @@ public class CouchbaseSourceTask extends SourceTask {
         lifecycle.logCommittedToKafkaTopic(couchbaseRecord, metadata);
       }
     } else {
-      LOGGER.warn("Committed a record we didn't create? Record key {}", record.key());
+      LOGGER.warn("Committed a record we didn't create? Record key {}; taskUuid={}", record.key(), taskUuid());
     }
 
     sourceHandler.onRecordCommitted(record, metadata);
@@ -354,13 +432,31 @@ public class CouchbaseSourceTask extends SourceTask {
     }
   }
 
+  private static boolean jsonpathMatch(JsonPath filter, byte[] document) {
+    try {
+      if (filter == ROOT_JSON_PATH) {
+        return true;
+      }
+      List<?> result = filter.read(new ByteArrayInputStream(document), jsonpathConf);
+      return !result.isEmpty();
+    } catch (InvalidJsonException | IOException e) {
+      return false;
+    }
+  }
+
   private String getDefaultTopic(DocumentEvent docEvent) {
-    CollectionMetadata collectionMetadata = docEvent.collectionMetadata();
-    return defaultTopicTemplate
-        .replace("${bucket}", bucket)
-        .replace("${scope}", collectionMetadata.scopeName())
-        .replace("${collection}", collectionMetadata.collectionName())
-        .replace("%", "_"); // % is valid in Couchbase name but not Kafka topic name
+    ScopeAndCollection scopeAndCollection = scopeAndCollection(docEvent);
+    String topic = topicTemplate.get(scopeAndCollection);
+
+    if (topic.contains("${")) {
+      return topic
+          .replace("${bucket}", bucket)
+          .replace("${scope}", scopeAndCollection.getScope())
+          .replace("${collection}", scopeAndCollection.getCollection())
+          .replace("%", "_"); // % is valid in Couchbase name but not Kafka topic name
+    }
+
+    return topic;
   }
 
   private ConversionResult convertToSourceRecords(List<DocumentChange> events) {
@@ -376,12 +472,24 @@ public class CouchbaseSourceTask extends SourceTask {
       //
       // We could assume the topic config is always present, but maybe a trickster
       // inserted a real document with the same key as a synthetic tombstone.
-      if (isSyntheticInitialOffsetTombstone(e) && intialOffsetTopic.isPresent()) {
-        String topic = intialOffsetTopic.get();
+      if (isSyntheticInitialOffsetTombstone(e) && initialOffsetTopic.isPresent()) {
+        String topic = initialOffsetTopic.get();
         SourceRecord sourceRecord = createSourceOffsetUpdateRecord(e.getKey(), topic, e);
         lifecycle.logConvertedToKafkaRecord(e, sourceRecord);
         results.add(sourceRecord);
         initialOffsets++;
+        continue;
+      }
+
+      // Pre-filter with jsonpath
+      boolean jsonpathPassed = jsonpathMatch(jsonPaths.get(
+          ScopeAndCollection
+              .parse(docEvent.collectionMetadata().scopeName() + "." + docEvent.collectionMetadata().collectionName())),
+          docEvent.content());
+      if (!jsonpathPassed) {
+        lifecycle.logSkippedBecauseJsonpathFilterSaysIgnore(e);
+        dropped++;
+        blackHoleTopic.ifPresent(topic -> results.add(createSourceOffsetUpdateRecord(topic, e)));
         continue;
       }
 
@@ -439,9 +547,7 @@ public class CouchbaseSourceTask extends SourceTask {
   }
 
   private List<CouchbaseSourceRecord> convertToSourceRecords(DocumentChange change, DocumentEvent docEvent) {
-    String topic = collectionToTopic.getOrDefault(
-        scopeAndCollection(docEvent),
-        getDefaultTopic(docEvent));
+    String topic = getDefaultTopic(docEvent);
 
     List<SourceRecordBuilder> builders = handlerTimer
         .record(() -> sourceHandler.convertToSourceRecords(new SourceHandlerParams(docEvent, topic, noValue)));
@@ -470,31 +576,94 @@ public class CouchbaseSourceTask extends SourceTask {
     return result;
   }
 
-  @Override
-  public void stop() {
-    taskLifecycle.logTaskStopped();
-
-    this.watchdog.stop();
-
-    // Cleanup source handler resources to prevent hanging during shutdown
-    if (sourceHandler != null) {
-      cleanupSourceHandler(sourceHandler);
+  private void cleanup() {
+    // The framework may call stop() multiple times. Only need to clean up once.
+    if (cleanup.alreadyCalled()) {
+      LOGGER.info("Ignoring redundant cleanup request; taskUuid={}", taskUuid());
+      return;
     }
 
-    if (this.meterRegistry != null) {
-      this.meterRegistry.close();
-    }
-
-    if (couchbaseReader != null) {
-      couchbaseReader.shutdown();
+    // The connector's stop() method must return quickly. Do the actual cleanup work
+    // in a separate thread
+    // because it can take a while to ensure an orderly shutdown of the DCP client.
+    cleanupThreadFactory.newThread(() -> {
       try {
-        couchbaseReader.join(STOP_TIMEOUT_MILLIS);
-        if (couchbaseReader.isAlive()) {
-          LOGGER.error("Reader thread is still alive after shutdown request.");
+        Thread.currentThread().setName(Thread.currentThread().getName() + "-" + taskUuid());
+
+        if (startupComplete.getCount() != 0) {
+          // Prior to the fix for https://issues.apache.org/jira/browse/KAFKA-10792
+          // the framework could call stop() on a separate thread from start(),
+          // potentially before start() finished.
+
+          LOGGER.info(
+              "Task was asked to stop before it finished starting; deferring cleanup until start() completes. taskUuid={}",
+              taskUuid());
+          // The framework should never call stop without also calling start, but out of
+          // paranoia let's not bank on it.
+          // In practice, we won't have to wait much longer than the bootstrap timeout
+          // which is _well_ under the safeguard timeout specified here.
+          Duration safeguardTimeout = Duration.ofMinutes(30);
+          if (!startupComplete.await(safeguardTimeout.toMillis(), MILLISECONDS)) {
+            LOGGER.error(
+                "This task's start() method did not complete within the safeguard timeout of {}. Making a last-ditch effort to clean up. taskUuid={}",
+                safeguardTimeout, taskUuid());
+          }
         }
-      } catch (InterruptedException e) {
-        LOGGER.error("Interrupted while joining reader thread.", e);
+
+        LOGGER.info("Cleaning up now; taskUuid={}", taskUuid());
+
+        this.watchdog.stop();
+
+        if (this.meterRegistry != null) {
+          this.meterRegistry.close();
+        }
+
+        if (couchbaseReader != null) {
+          couchbaseReader.shutdown();
+          try {
+            couchbaseReader.join(STOP_TIMEOUT_MILLIS);
+            if (couchbaseReader.isAlive()) {
+              LOGGER.error("Reader thread is still alive after shutdown request.");
+            }
+          } catch (InterruptedException e) {
+            LOGGER.error("Interrupted while joining reader thread.", e);
+          }
+        }
+      } catch (Throwable t) {
+        LOGGER.error("Error while cleaning up resources; taskUuid={}", taskUuid(), t);
+
+      } finally {
+        taskLifecycle.logTaskCleanupComplete();
       }
+    }).start();
+  }
+
+  /**
+   * Cleanup source handler resources to prevent hanging during shutdown.
+   * This method attempts to call cleanup on handlers that support it.
+   */
+  private void cleanupSourceHandler(MultiSourceHandler handler) {
+    try {
+      // Check if this is a wrapper around a SourceHandler (created in
+      // createSourceHandler method)
+      if (handler.getClass().isAnonymousClass()) {
+        // This is likely the anonymous MultiSourceHandler wrapper we create
+        // Try to access the wrapped SourceHandler via reflection
+        java.lang.reflect.Field[] fields = handler.getClass().getDeclaredFields();
+        for (java.lang.reflect.Field field : fields) {
+          if (field.getType().getName().contains("SourceHandler")) {
+            field.setAccessible(true);
+            Object sourceHandler = field.get(handler);
+            if (sourceHandler instanceof com.netdocuments.connect.kafka.handler.source.NDSourceHandler) {
+              LOGGER.info("Calling cleanup on NDSourceHandler during shutdown");
+              ((com.netdocuments.connect.kafka.handler.source.NDSourceHandler) sourceHandler).cleanup();
+            }
+            break;
+          }
+        }
+      }
+    } catch (Exception e) {
+      LOGGER.warn("Error during source handler cleanup", e);
     }
   }
 
@@ -538,7 +707,7 @@ public class CouchbaseSourceTask extends SourceTask {
     Map<Map<String, Object>, Map<String, Object>> offsets = context.offsetStorageReader()
         .offsets(sourcePartitions(partitions));
 
-    LOGGER.debug("Raw source offsets: {}", offsets);
+    LOGGER.debug("Raw source offsets: {}; taskUuid={}", offsets, taskUuid());
 
     // Remove partitions from this set as we see them in the map. Expect a map entry
     // for each
@@ -563,8 +732,8 @@ public class CouchbaseSourceTask extends SourceTask {
     if (!missingPartitions.isEmpty()) {
       // Something is wrong with the offset storage reader.
       // We should have seen one entry for each requested partition.
-      LOGGER.error("Offset storage reader returned no information about these partitions: {}",
-          PartitionSet.from(missingPartitions));
+      LOGGER.error("Offset storage reader returned no information about these partitions: {}; taskUuid={}",
+          PartitionSet.from(missingPartitions), taskUuid());
     }
 
     return partitionToSourceOffset;

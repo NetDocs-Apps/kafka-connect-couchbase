@@ -36,6 +36,7 @@ import static com.couchbase.connect.kafka.util.ConnectHelper.getConnectorContext
 import static com.couchbase.connect.kafka.util.ConnectHelper.getTaskIdFromLoggingContext;
 import static java.time.temporal.ChronoUnit.MICROS;
 import static java.util.Collections.emptyMap;
+import static java.util.Objects.requireNonNull;
 
 /**
  * Logs document lifecycle events.
@@ -45,6 +46,7 @@ public class SourceDocumentLifecycle {
   public enum Milestone {
     RECEIVED_FROM_COUCHBASE,
 
+    SKIPPED_BECAUSE_JSONPATH_SAYS_IGNORE,
     SKIPPED_BECAUSE_FILTER_SAYS_IGNORE,
     SKIPPED_BECAUSE_HANDLER_SAYS_IGNORE,
 
@@ -60,17 +62,19 @@ public class SourceDocumentLifecycle {
   private static final Logger log = LoggerFactory.getLogger(SourceDocumentLifecycle.class);
 
   private final String taskId = getTaskIdFromLoggingContext().orElse("?");
+  private final String taskUuid;
   private final LogLevel logLevel;
 
   public boolean enabled() {
     return logLevel.isEnabled(log);
   }
 
-  public static SourceDocumentLifecycle create(LoggingConfig config) {
-    return new SourceDocumentLifecycle(config);
+  public static SourceDocumentLifecycle create(String taskUuid, LoggingConfig config) {
+    return new SourceDocumentLifecycle(taskUuid, config);
   }
 
-  private SourceDocumentLifecycle(LoggingConfig config) {
+  private SourceDocumentLifecycle(String taskUuid, LoggingConfig config) {
+    this.taskUuid = requireNonNull(taskUuid);
     this.logLevel = config.logDocumentLifecycle() ? LogLevel.INFO : LogLevel.DEBUG;
     log.info("Logging document lifecycle milestones to this category at {} level", logLevel);
   }
@@ -88,6 +92,8 @@ public class SourceDocumentLifecycle {
       logMilestone(event, Milestone.RECEIVED_FROM_COUCHBASE, details);
     }
   }
+
+  public void logSkippedBecauseJsonpathFilterSaysIgnore(DocumentChange event) {logMilestone(event, Milestone.SKIPPED_BECAUSE_JSONPATH_SAYS_IGNORE);}
 
   public void logSkippedBecauseFilterSaysIgnore(DocumentChange event) {
     logMilestone(event, Milestone.SKIPPED_BECAUSE_FILTER_SAYS_IGNORE);
@@ -145,6 +151,7 @@ public class SourceDocumentLifecycle {
 
       message.put("documentId", sourceRecord.getCouchbaseDocumentId());
       message.putAll(milestoneDetails);
+      message.put("taskUuid", taskUuid);
       doLog(message);
     }
   }
@@ -160,6 +167,7 @@ public class SourceDocumentLifecycle {
 
       message.put("documentId", event.getQualifiedKey());
       message.putAll(milestoneDetails);
+      message.put("taskUuid", taskUuid);
       doLog(message);
     }
   }
