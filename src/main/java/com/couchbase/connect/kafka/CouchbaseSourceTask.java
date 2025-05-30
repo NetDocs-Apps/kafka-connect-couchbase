@@ -140,8 +140,6 @@ public class CouchbaseSourceTask extends SourceTask {
   private Timer timeBetweenPollsTimer;
   private NanoTimestamp endOfLastPoll;
 
-  private final Watchdog watchdog = new Watchdog();
-
   // Guard against race condition where the framework calls stop() before start()
   // is complete,
   // which could happen prior to the fix for
@@ -636,64 +634,6 @@ public class CouchbaseSourceTask extends SourceTask {
         taskLifecycle.logTaskCleanupComplete();
       }
     }).start();
-  }
-
-  /**
-   * Cleanup source handler resources to prevent hanging during shutdown.
-   * This method attempts to call cleanup on handlers that support it.
-   */
-  private void cleanupSourceHandler(MultiSourceHandler handler) {
-    try {
-      // Check if this is a wrapper around a SourceHandler (created in
-      // createSourceHandler method)
-      if (handler.getClass().isAnonymousClass()) {
-        // This is likely the anonymous MultiSourceHandler wrapper we create
-        // Try to access the wrapped SourceHandler via reflection
-        java.lang.reflect.Field[] fields = handler.getClass().getDeclaredFields();
-        for (java.lang.reflect.Field field : fields) {
-          if (field.getType().getName().contains("SourceHandler")) {
-            field.setAccessible(true);
-            Object sourceHandler = field.get(handler);
-            if (sourceHandler instanceof com.netdocuments.connect.kafka.handler.source.NDSourceHandler) {
-              LOGGER.info("Calling cleanup on NDSourceHandler during shutdown");
-              ((com.netdocuments.connect.kafka.handler.source.NDSourceHandler) sourceHandler).cleanup();
-            }
-            break;
-          }
-        }
-      }
-    } catch (Exception e) {
-      LOGGER.warn("Error during source handler cleanup", e);
-    }
-  }
-
-  /**
-   * Cleanup source handler resources to prevent hanging during shutdown.
-   * This method attempts to call cleanup on handlers that support it.
-   */
-  private void cleanupSourceHandler(MultiSourceHandler handler) {
-    try {
-      // Check if this is a wrapper around a SourceHandler (created in
-      // createSourceHandler method)
-      if (handler.getClass().isAnonymousClass()) {
-        // This is likely the anonymous MultiSourceHandler wrapper we create
-        // Try to access the wrapped SourceHandler via reflection
-        java.lang.reflect.Field[] fields = handler.getClass().getDeclaredFields();
-        for (java.lang.reflect.Field field : fields) {
-          if (field.getType().getName().contains("SourceHandler")) {
-            field.setAccessible(true);
-            Object sourceHandler = field.get(handler);
-            if (sourceHandler instanceof com.netdocuments.connect.kafka.handler.source.NDSourceHandler) {
-              LOGGER.info("Calling cleanup on NDSourceHandler during shutdown");
-              ((com.netdocuments.connect.kafka.handler.source.NDSourceHandler) sourceHandler).cleanup();
-            }
-            break;
-          }
-        }
-      }
-    } catch (Exception e) {
-      LOGGER.warn("Error during source handler cleanup", e);
-    }
   }
 
   /**
