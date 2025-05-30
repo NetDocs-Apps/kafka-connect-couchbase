@@ -18,6 +18,7 @@ package com.netdocuments.connect.kafka.handler.source;
 import software.amazon.awssdk.auth.credentials.AwsCredentialsProviderChain;
 import software.amazon.awssdk.auth.credentials.EnvironmentVariableCredentialsProvider;
 import software.amazon.awssdk.auth.credentials.ProfileCredentialsProvider;
+import software.amazon.awssdk.core.client.config.ClientOverrideConfiguration;
 import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.s3.S3Client;
@@ -39,6 +40,7 @@ import org.slf4j.LoggerFactory;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.*;
 
@@ -232,6 +234,13 @@ public class NDSourceHandler extends RawJsonWithMetadataSourceHandler {
       isS3Enabled = true;
       awsProfile = config.getString(AWS_PROFILE_CONFIG);
       LOGGER.info("Initializing S3 client with bucket={}, region={}, profile={}", s3Bucket, s3Region, awsProfile);
+
+      // Configure timeouts to prevent hanging during shutdown
+      ClientOverrideConfiguration clientConfig = ClientOverrideConfiguration.builder()
+          .apiCallTimeout(Duration.ofSeconds(30))
+          .apiCallAttemptTimeout(Duration.ofSeconds(10))
+          .build();
+
       if (awsProfile != null) {
         ProfileCredentialsProvider credentialsProvider = ProfileCredentialsProvider.builder()
             .profileName(awsProfile) // Your desired profile name
@@ -243,10 +252,12 @@ public class NDSourceHandler extends RawJsonWithMetadataSourceHandler {
         s3Client = S3Client.builder()
             .region(Region.of(s3Region))
             .credentialsProvider(credentialsProviderChain)
+            .overrideConfiguration(clientConfig)
             .build();
       } else {
         s3Client = S3Client.builder()
             .region(Region.of(s3Region))
+            .overrideConfiguration(clientConfig)
             .build();
       }
     }
@@ -363,6 +374,8 @@ public class NDSourceHandler extends RawJsonWithMetadataSourceHandler {
 
   /**
    * Uploads the document content to S3.
+   * Uses defensive error handling to prevent S3 failures from blocking connector
+   * shutdown.
    */
   private void uploadToS3(String s3Key, byte[] document) {
     try {
@@ -375,8 +388,9 @@ public class NDSourceHandler extends RawJsonWithMetadataSourceHandler {
       s3Client.putObject(putObjectRequest, RequestBody.fromBytes(document));
       LOGGER.debug("Uploaded document to S3: s3://{}/{}", s3Bucket, s3Key);
     } catch (Exception e) {
-      LOGGER.error("Failed to upload document to S3: {}", e.getMessage(), e);
-      throw e;
+      LOGGER.error("Failed to upload document to S3: s3://{}/{}. Error: {}", s3Bucket, s3Key, e.getMessage(), e);
+      // Don't re-throw the exception to prevent blocking connector shutdown
+      // The document will be processed without S3 upload
     }
   }
 
@@ -537,6 +551,23 @@ public class NDSourceHandler extends RawJsonWithMetadataSourceHandler {
   private String getCloudEventType(DocumentEvent documentEvent, String suffix) {
     return String.format("%s%s", cloudEventType.replace("{bucket}", documentEvent.bucket())
         .replace("{type}", documentEvent.type().schemaName()), suffix);
+  }
+
+  /**
+   * Cleanup method to properly close resources during shutdown.
+   * This method should be called when the connector is stopping.
+   */
+  public void cleanup() {
+    if (s3Client != null) {
+      try {
+        LOGGER.info("Closing S3 client during handler cleanup");
+        s3Client.close();
+      } catch (Exception e) {
+        LOGGER.warn("Error closing S3 client during cleanup", e);
+      } finally {
+        s3Client = null;
+      }
+    }
   }
 
   // For testing purposes

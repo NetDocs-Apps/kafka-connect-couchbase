@@ -164,7 +164,8 @@ public class CouchbaseSourceTask extends SourceTask {
 
     filter = Utils.newInstance(config.eventFilter());
     filter.init(unmodifiableProperties);
-    filterIsNoop = filter.getClass().equals(AllPassFilter.class); // not just instanceof, because user could do something silly like extend AllPassFilter.
+    filterIsNoop = filter.getClass().equals(AllPassFilter.class); // not just instanceof, because user could do
+                                                                  // something silly like extend AllPassFilter.
 
     sourceHandler = createSourceHandler(config);
     sourceHandler.init(unmodifiableProperties);
@@ -177,7 +178,7 @@ public class CouchbaseSourceTask extends SourceTask {
     defaultTopicTemplate = config.topic();
     collectionToTopic = TopicMap.parseCollectionToTopic(config.collectionToTopic());
     bucket = config.bucket();
-    //noinspection deprecation
+    // noinspection deprecation
     connectorNameInOffsets = config.connectorNameInOffsets();
     batchSizeMax = config.batchSizeMax();
     noValue = config.noValue();
@@ -193,12 +194,12 @@ public class CouchbaseSourceTask extends SourceTask {
 
     taskLifecycle.logSourceOffsetsRead(
         partitionToSavedSeqno,
-        PartitionSet.from(partitionsWithoutSavedOffsets)
-    );
+        PartitionSet.from(partitionsWithoutSavedOffsets));
 
     queue = new LinkedBlockingQueue<>();
     errorQueue = new LinkedBlockingQueue<>(1);
-    couchbaseReader = new CouchbaseReader(config, connectorName, queue, errorQueue, partitions, partitionToSavedSeqno, lifecycle, meterRegistry, intialOffsetTopic.isPresent(), taskLifecycle);
+    couchbaseReader = new CouchbaseReader(config, connectorName, queue, errorQueue, partitions, partitionToSavedSeqno,
+        lifecycle, meterRegistry, intialOffsetTopic.isPresent(), taskLifecycle);
     couchbaseReader.start();
 
     endOfLastPoll = NanoTimestamp.now();
@@ -221,7 +222,8 @@ public class CouchbaseSourceTask extends SourceTask {
 
   private static @Nullable MeterRegistry newLoggingMeterRegistry(CouchbaseSourceTaskConfig config) {
     Duration interval = config.metricsInterval();
-    String configKey = ConfigHelper.keyName(CouchbaseSourceTaskConfig.class, CouchbaseSourceTaskConfig::metricsInterval);
+    String configKey = ConfigHelper.keyName(CouchbaseSourceTaskConfig.class,
+        CouchbaseSourceTaskConfig::metricsInterval);
 
     if (interval.isZero()) {
       LOGGER.info("Metrics logging is disabled because config property '" + configKey + "' is set to 0.");
@@ -232,8 +234,10 @@ public class CouchbaseSourceTask extends SourceTask {
       Logger metricsLogger = LoggerFactory.getLogger(metricsCategory);
       LOGGER.info("Will log metrics to logging category '" + metricsCategory + "' at interval: " + interval);
 
-      // Don't need to set "connector" or "task" tags because this info is already in the
-      // "connector.context" Mapped Diagnostic Context (MDC) attribute, which is included in the
+      // Don't need to set "connector" or "task" tags because this info is already in
+      // the
+      // "connector.context" Mapped Diagnostic Context (MDC) attribute, which is
+      // included in the
       // Kafka Connect logging pattern by default.
       return LoggingMeterRegistry
           .builder(k -> "logging.step".equals(k) ? interval.toMillis() + "ms" : null)
@@ -285,7 +289,8 @@ public class CouchbaseSourceTask extends SourceTask {
 
         filteredCounter.increment(results.dropped);
         if (results.synthetic > 0) {
-          LOGGER.info("Poll returns {} result(s) ({} synthetic; filtered out {})", results.published + results.synthetic, results.synthetic, results.dropped);
+          LOGGER.info("Poll returns {} result(s) ({} synthetic; filtered out {})",
+              results.published + results.synthetic, results.synthetic, results.dropped);
         } else {
           LOGGER.info("Poll returns {} result(s) (filtered out {})", results.published, results.dropped);
         }
@@ -417,7 +422,8 @@ public class CouchbaseSourceTask extends SourceTask {
    * as a way to tell Kafka Connect about the source offset of the ignored event.
    */
   private SourceRecord createSourceOffsetUpdateRecord(String topic, DocumentChange change) {
-    // Include vbucket in key so records aren't all assigned to the same Kafka partition
+    // Include vbucket in key so records aren't all assigned to the same Kafka
+    // partition
     String key = "ignored-" + change.getVbucket();
     return createSourceOffsetUpdateRecord(key, topic, change);
   }
@@ -429,21 +435,19 @@ public class CouchbaseSourceTask extends SourceTask {
             change,
             sourcePartition(change.getVbucket()),
             sourceOffset(change),
-            topic
-        );
+            topic);
   }
 
   private List<CouchbaseSourceRecord> convertToSourceRecords(DocumentChange change, DocumentEvent docEvent) {
     String topic = collectionToTopic.getOrDefault(
         scopeAndCollection(docEvent),
-        getDefaultTopic(docEvent)
-    );
+        getDefaultTopic(docEvent));
 
-    List<SourceRecordBuilder> builders = handlerTimer.record(() ->
-        sourceHandler.convertToSourceRecords(new SourceHandlerParams(docEvent, topic, noValue))
-    );
+    List<SourceRecordBuilder> builders = handlerTimer
+        .record(() -> sourceHandler.convertToSourceRecords(new SourceHandlerParams(docEvent, topic, noValue)));
 
-    requireNonNull(builders, "The source handler's convertToSourceRecords() method returned null instead of a List; this is forbidden.");
+    requireNonNull(builders,
+        "The source handler's convertToSourceRecords() method returned null instead of a List; this is forbidden.");
 
     if (builders.isEmpty()) {
       return emptyList();
@@ -451,15 +455,15 @@ public class CouchbaseSourceTask extends SourceTask {
 
     List<CouchbaseSourceRecord> result = new ArrayList<>(builders.size());
     for (SourceRecordBuilder builder : builders) {
-      requireNonNull(builder, "The source handler's convertToSourceRecords() method returned a list containing a null item; this is forbidden.");
+      requireNonNull(builder,
+          "The source handler's convertToSourceRecords() method returned a list containing a null item; this is forbidden.");
 
       headerSetter.setHeaders(builder.headers(), docEvent);
       CouchbaseSourceRecord record = builder.build(
           change,
           sourcePartition(docEvent.partition()),
           sourceOffset(change),
-          topic
-      );
+          topic);
       result.add(record);
     }
 
@@ -471,6 +475,11 @@ public class CouchbaseSourceTask extends SourceTask {
     taskLifecycle.logTaskStopped();
 
     this.watchdog.stop();
+
+    // Cleanup source handler resources to prevent hanging during shutdown
+    if (sourceHandler != null) {
+      cleanupSourceHandler(sourceHandler);
+    }
 
     if (this.meterRegistry != null) {
       this.meterRegistry.close();
@@ -490,8 +499,38 @@ public class CouchbaseSourceTask extends SourceTask {
   }
 
   /**
+   * Cleanup source handler resources to prevent hanging during shutdown.
+   * This method attempts to call cleanup on handlers that support it.
+   */
+  private void cleanupSourceHandler(MultiSourceHandler handler) {
+    try {
+      // Check if this is a wrapper around a SourceHandler (created in
+      // createSourceHandler method)
+      if (handler.getClass().isAnonymousClass()) {
+        // This is likely the anonymous MultiSourceHandler wrapper we create
+        // Try to access the wrapped SourceHandler via reflection
+        java.lang.reflect.Field[] fields = handler.getClass().getDeclaredFields();
+        for (java.lang.reflect.Field field : fields) {
+          if (field.getType().getName().contains("SourceHandler")) {
+            field.setAccessible(true);
+            Object sourceHandler = field.get(handler);
+            if (sourceHandler instanceof com.netdocuments.connect.kafka.handler.source.NDSourceHandler) {
+              LOGGER.info("Calling cleanup on NDSourceHandler during shutdown");
+              ((com.netdocuments.connect.kafka.handler.source.NDSourceHandler) sourceHandler).cleanup();
+            }
+            break;
+          }
+        }
+      }
+    } catch (Exception e) {
+      LOGGER.warn("Error during source handler cleanup", e);
+    }
+  }
+
+  /**
    * Loads as many of the requested source offsets as possible.
-   * See the caveats for {@link org.apache.kafka.connect.storage.OffsetStorageReader#offsets(Collection)}.
+   * See the caveats for
+   * {@link org.apache.kafka.connect.storage.OffsetStorageReader#offsets(Collection)}.
    *
    * @return a map of partitions to sequence numbers.
    */
@@ -501,9 +540,12 @@ public class CouchbaseSourceTask extends SourceTask {
 
     LOGGER.debug("Raw source offsets: {}", offsets);
 
-    // Remove partitions from this set as we see them in the map. Expect a map entry for each
-    // requested partition. A null-valued entry indicates the partition has no saved offset.
-    // A *missing* entry indicates something bad happened inside the offset storage reader.
+    // Remove partitions from this set as we see them in the map. Expect a map entry
+    // for each
+    // requested partition. A null-valued entry indicates the partition has no saved
+    // offset.
+    // A *missing* entry indicates something bad happened inside the offset storage
+    // reader.
     Set<Integer> missingPartitions = new HashSet<>(partitions);
 
     // Populated from the map entries with non-null values.
@@ -522,8 +564,7 @@ public class CouchbaseSourceTask extends SourceTask {
       // Something is wrong with the offset storage reader.
       // We should have seen one entry for each requested partition.
       LOGGER.error("Offset storage reader returned no information about these partitions: {}",
-          PartitionSet.from(missingPartitions)
-      );
+          PartitionSet.from(missingPartitions));
     }
 
     return partitionToSourceOffset;
@@ -538,12 +579,14 @@ public class CouchbaseSourceTask extends SourceTask {
   }
 
   /**
-   * Converts a Couchbase DCP partition (also known as a vBucket) into the Map format required by Kafka Connect.
+   * Converts a Couchbase DCP partition (also known as a vBucket) into the Map
+   * format required by Kafka Connect.
    */
   private Map<String, Object> sourcePartition(int partition) {
     final Map<String, Object> sourcePartition = new HashMap<>(3);
     sourcePartition.put("bucket", bucket);
-    sourcePartition.put("partition", String.valueOf(partition)); // Stringify for robust round-tripping across Kafka [de]serialization
+    sourcePartition.put("partition", String.valueOf(partition)); // Stringify for robust round-tripping across Kafka
+                                                                 // [de]serialization
     if (connectorNameInOffsets) {
       sourcePartition.put("connector", connectorName);
     }
@@ -551,7 +594,8 @@ public class CouchbaseSourceTask extends SourceTask {
   }
 
   /**
-   * Converts a Couchbase DCP stream offset into the Map format required by Kafka Connect.
+   * Converts a Couchbase DCP stream offset into the Map format required by Kafka
+   * Connect.
    */
   private static Map<String, Object> sourceOffset(DocumentChange change) {
     return new SourceOffset(change.getOffset()).toMap();
@@ -571,10 +615,11 @@ public class CouchbaseSourceTask extends SourceTask {
     }
 
     if (!(handlerObject instanceof SourceHandler)) {
-      String configKey = ConfigHelper.keyName(CouchbaseSourceTaskConfig.class, CouchbaseSourceTaskConfig::sourceHandler);
+      String configKey = ConfigHelper.keyName(CouchbaseSourceTaskConfig.class,
+          CouchbaseSourceTaskConfig::sourceHandler);
       throw new ConfigException(
           "Invalid value for connector config property '" + configKey + "' ;" +
-          " Source handler must be an instance of " + SourceHandler.class.getName()
+              " Source handler must be an instance of " + SourceHandler.class.getName()
               + " or " + MultiSourceHandler.class.getName()
               + ", but got: " + handlerObject.getClass().getName());
     }
