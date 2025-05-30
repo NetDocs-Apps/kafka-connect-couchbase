@@ -42,7 +42,6 @@ import java.util.stream.Collectors;
 import static com.couchbase.client.java.analytics.AnalyticsOptions.analyticsOptions;
 import static java.nio.charset.StandardCharsets.UTF_8;
 
-
 /**
  * This class is used when we have a source and Analytics service as the sink.
  * We can extend this class to deal with different sources.
@@ -65,12 +64,12 @@ public class AnalyticsSinkHandler implements SinkHandler {
     return Pair.of(whereClause, JsonArray.from(values));
   }
 
-  protected static Pair<String, JsonArray> deleteQuery(String keySpace, JsonObject documentKeys) {
+  public static Pair<String, JsonArray> deleteQuery(String keySpace, JsonObject documentKeys) {
     Pair<String, JsonArray> whereClause = prepareWhereClauseForDelete(documentKeys);
     return Pair.of("DELETE FROM " + keySpace + " WHERE " + whereClause.getLeft() + ";", whereClause.getRight());
   }
 
-  protected static JsonObject getJsonObject(String object) {
+  public static JsonObject getJsonObject(String object) {
     JsonObject node = null;
     try {
       node = JsonObject.fromJson(object);
@@ -108,7 +107,8 @@ public class AnalyticsSinkHandler implements SinkHandler {
     String documentKeys = getDocumentId(params);
     SinkDocument doc = params.document().orElse(null);
 
-    // if bucketName is present then keyspace=bucketName.scopeName.collectionName otherwise keyspace=scopeName.collectionName
+    // if bucketName is present then keyspace=bucketName.scopeName.collectionName
+    // otherwise keyspace=scopeName.collectionName
     String keySpace = params.getKeyspace().format();
 
     if (doc != null) {
@@ -125,10 +125,9 @@ public class AnalyticsSinkHandler implements SinkHandler {
 
       String statement = upsertStatement(keySpace, node);
 
-      Mono<?> action = Mono.defer(() ->
-          params.cluster()
-              .analyticsQuery(statement, analyticsOptions().timeout(analyticsQueryTimeout).parameters(node))
-              .map(ReactiveAnalyticsResult::metaData)); // metadata arrival signals query completion
+      Mono<?> action = Mono.defer(() -> params.cluster()
+          .analyticsQuery(statement, analyticsOptions().timeout(analyticsQueryTimeout).parameters(node))
+          .map(ReactiveAnalyticsResult::metaData)); // metadata arrival signals query completion
 
       ConcurrencyHint concurrencyHint = ConcurrencyHint.of(documentKeys);
       return new SinkAction(action, concurrencyHint);
@@ -145,10 +144,10 @@ public class AnalyticsSinkHandler implements SinkHandler {
       }
 
       Pair<String, JsonArray> deleteQuery = deleteQuery(keySpace, documentKeysJson);
-      Mono<?> action = Mono.defer(() ->
-          params.cluster()
-              .analyticsQuery(deleteQuery.getLeft(), analyticsOptions().timeout(analyticsQueryTimeout).parameters(deleteQuery.getRight()))
-              .map(ReactiveAnalyticsResult::metaData)); // metadata arrival signals query completion
+      Mono<?> action = Mono.defer(() -> params.cluster()
+          .analyticsQuery(deleteQuery.getLeft(),
+              analyticsOptions().timeout(analyticsQueryTimeout).parameters(deleteQuery.getRight()))
+          .map(ReactiveAnalyticsResult::metaData)); // metadata arrival signals query completion
 
       ConcurrencyHint concurrencyHint = ConcurrencyHint.of(documentKeys);
       return new SinkAction(action, concurrencyHint);
@@ -162,18 +161,20 @@ public class AnalyticsSinkHandler implements SinkHandler {
       return Collections.emptyList();
     }
 
-    AnalyticsBatchBuilder batchBuilder = new AnalyticsBatchBuilder(maxSizeOfRecordsInBytesLimit, maxRecordsInBatchLimit);
+    AnalyticsBatchBuilder batchBuilder = new AnalyticsBatchBuilder(maxSizeOfRecordsInBytesLimit,
+        maxRecordsInBatchLimit);
     final ReactiveCluster cluster = params.get(0).cluster();
 
     for (SinkHandlerParams param : params) {
       String documentIds = getDocumentId(param);
       SinkDocument doc = param.document().orElse(null);
 
-      // if bucketName is present then keyspace=bucketName.scopeName.collectionName otherwise keyspace=scopeName.collectionName
+      // if bucketName is present then keyspace=bucketName.scopeName.collectionName
+      // otherwise keyspace=scopeName.collectionName
       String keySpace = param.getKeyspace().format();
 
       if (doc != null) {
-        //Upsertion Case
+        // Upsertion Case
         final JsonObject node;
         try {
           node = JsonObject.fromJson(doc.content());
@@ -204,8 +205,7 @@ public class AnalyticsSinkHandler implements SinkHandler {
         }
 
         batchBuilder.add(
-            new N1qlData(keySpace, node.toString(), OperationType.UPSERT, ConcurrencyHint.of(documentIds))
-        );
+            new N1qlData(keySpace, node.toString(), OperationType.UPSERT, ConcurrencyHint.of(documentIds)));
       } else {
         // when doc is null we are deleting the document
         if (documentIds.contains("`")) {
@@ -222,14 +222,15 @@ public class AnalyticsSinkHandler implements SinkHandler {
         String deleteCondition = generateDeleteCondition(documentKeysJson);
 
         batchBuilder.add(
-            new N1qlData(keySpace, deleteCondition, OperationType.DELETE, ConcurrencyHint.of(documentIds))
-        );
+            new N1qlData(keySpace, deleteCondition, OperationType.DELETE, ConcurrencyHint.of(documentIds)));
       }
     }
 
     return batchBuilder.build().stream().map(statement -> new SinkAction(
-        Mono.defer(() -> cluster.analyticsQuery(statement, AnalyticsOptions.analyticsOptions().timeout(analyticsQueryTimeout)).map(ReactiveAnalyticsResult::metaData)), ConcurrencyHint.neverConcurrent()
-    )).collect(Collectors.toList());
+        Mono.defer(
+            () -> cluster.analyticsQuery(statement, AnalyticsOptions.analyticsOptions().timeout(analyticsQueryTimeout))
+                .flatMap(result -> Mono.just(result.metaData()))),
+        ConcurrencyHint.neverConcurrent())).collect(Collectors.toList());
   }
 
   private String generateDeleteCondition(JsonObject documentKeysJson) {
