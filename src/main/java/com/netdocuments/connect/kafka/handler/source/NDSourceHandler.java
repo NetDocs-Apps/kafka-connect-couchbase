@@ -172,38 +172,75 @@ public class NDSourceHandler extends RawJsonWithMetadataSourceHandler {
    * Extracts all configured fields with timeout protection.
    */
   Map<String, Object> extractFields(byte[] content) {
+    long startTime = System.nanoTime();
+
+    LOGGER.info("NDSourceHandler.extractFields() ENTRY - Content size: {} bytes", content.length);
+
     try {
       Set<String> allFields = getAllFieldsToExtract();
+      LOGGER.info("NDSourceHandler.extractFields() - Fields to extract: {} (count: {})", allFields, allFields.size());
 
       // Use timeout protection for field extraction
+      LOGGER.debug("NDSourceHandler.extractFields() - Submitting field extraction task to executor");
       Future<Map<String, Object>> future = fieldExtractionExecutor.submit(() -> {
-        return JsonPropertyExtractor.extract(
-            new ByteArrayInputStream(content),
-            allFields.toArray(new String[0]));
+        long taskStartTime = System.nanoTime();
+        LOGGER.info("NDSourceHandler.extractFields() - Field extraction task STARTED in executor thread");
+
+        try {
+          Map<String, Object> result = JsonPropertyExtractor.extract(
+              new ByteArrayInputStream(content),
+              allFields.toArray(new String[0]));
+
+          long taskDuration = (System.nanoTime() - taskStartTime) / 1_000_000;
+          LOGGER.info(
+              "NDSourceHandler.extractFields() - Field extraction task COMPLETED in executor thread (took {}ms, extracted {} fields)",
+              taskDuration, result.size());
+          return result;
+        } catch (Exception e) {
+          long taskDuration = (System.nanoTime() - taskStartTime) / 1_000_000;
+          LOGGER.error("NDSourceHandler.extractFields() - Error in field extraction task (took {}ms)", taskDuration, e);
+          return new HashMap<>();
+        }
       });
 
+      LOGGER.debug("NDSourceHandler.extractFields() - Waiting for field extraction task completion (timeout: 3s)");
       extractedFields = future.get(3, TimeUnit.SECONDS); // 3-second timeout
 
       // Add debug logging
-      LOGGER.debug("Extracted {} fields successfully", extractedFields.size());
+      LOGGER.info("NDSourceHandler.extractFields() - Extracted {} fields successfully", extractedFields.size());
       if (filterField != null && LOGGER.isDebugEnabled()) {
-        LOGGER.debug("Filter field '{}' value: {}", filterField, extractedFields.get(filterField));
+        LOGGER.debug("NDSourceHandler.extractFields() - Filter field '{}' value: {}", filterField,
+            extractedFields.get(filterField));
       }
 
+      long duration = (System.nanoTime() - startTime) / 1_000_000;
+      LOGGER.info("NDSourceHandler.extractFields() EXIT - Successfully extracted {} fields (took {}ms total)",
+          extractedFields.size(), duration);
       return extractedFields;
 
     } catch (TimeoutException e) {
-      LOGGER.warn("Field extraction timed out after 3 seconds, using empty field map");
+      long duration = (System.nanoTime() - startTime) / 1_000_000;
+      LOGGER.warn(
+          "NDSourceHandler.extractFields() TIMEOUT - Field extraction timed out after 3 seconds (took {}ms), using empty field map",
+          duration);
       return new HashMap<>();
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
-      LOGGER.warn("Field extraction was interrupted, using empty field map");
+      long duration = (System.nanoTime() - startTime) / 1_000_000;
+      LOGGER.warn(
+          "NDSourceHandler.extractFields() INTERRUPTED - Field extraction was interrupted (took {}ms), using empty field map",
+          duration);
       return new HashMap<>();
     } catch (ExecutionException e) {
-      LOGGER.error("Error during field extraction", e.getCause());
+      long duration = (System.nanoTime() - startTime) / 1_000_000;
+      LOGGER.error("NDSourceHandler.extractFields() ERROR - Error during field extraction (took {}ms)", duration,
+          e.getCause());
       return new HashMap<>();
     } catch (Exception e) {
-      LOGGER.error("Unexpected error while extracting fields from document", e);
+      long duration = (System.nanoTime() - startTime) / 1_000_000;
+      LOGGER.error(
+          "NDSourceHandler.extractFields() ERROR - Unexpected error while extracting fields from document (took {}ms)",
+          duration, e);
       return new HashMap<>();
     }
   }
@@ -360,17 +397,40 @@ public class NDSourceHandler extends RawJsonWithMetadataSourceHandler {
    */
   @Override
   public SourceRecordBuilder handle(SourceHandlerParams params) {
-    SourceRecordBuilder builder = new SourceRecordBuilder();
+    long startTime = System.nanoTime();
+    String documentKey = params.documentEvent().key();
 
-    addCloudEventHeaders(builder);
+    LOGGER.info("NDSourceHandler.handle() ENTRY - Processing document: {}", documentKey);
 
-    if (!buildValue(params, builder)) {
-      return null;
+    try {
+      SourceRecordBuilder builder = new SourceRecordBuilder();
+
+      LOGGER.debug("NDSourceHandler.handle() - Adding CloudEvent headers for document: {}", documentKey);
+      addCloudEventHeaders(builder);
+
+      LOGGER.debug("NDSourceHandler.handle() - Building value for document: {}", documentKey);
+      if (!buildValue(params, builder)) {
+        long duration = (System.nanoTime() - startTime) / 1_000_000;
+        LOGGER.info("NDSourceHandler.handle() EXIT - Document filtered out: {} (took {}ms)", documentKey, duration);
+        return null;
+      }
+
+      LOGGER.debug("NDSourceHandler.handle() - Setting topic and key for document: {}", documentKey);
+      SourceRecordBuilder result = builder
+          .topic(getTopic(params))
+          .key(Schema.STRING_SCHEMA, documentKey);
+
+      long duration = (System.nanoTime() - startTime) / 1_000_000;
+      LOGGER.info("NDSourceHandler.handle() EXIT - Successfully processed document: {} (took {}ms)", documentKey,
+          duration);
+      return result;
+
+    } catch (Exception e) {
+      long duration = (System.nanoTime() - startTime) / 1_000_000;
+      LOGGER.error("NDSourceHandler.handle() ERROR - Exception processing document: {} (took {}ms)", documentKey,
+          duration, e);
+      throw e;
     }
-
-    return builder
-        .topic(getTopic(params))
-        .key(Schema.STRING_SCHEMA, params.documentEvent().key());
   }
 
   /**
@@ -390,40 +450,81 @@ public class NDSourceHandler extends RawJsonWithMetadataSourceHandler {
    */
   @Override
   protected boolean buildValue(SourceHandlerParams params, SourceRecordBuilder builder) {
+    long startTime = System.nanoTime();
     final DocumentEvent docEvent = params.documentEvent();
     final DocumentEvent.Type type = docEvent.type();
+    String documentKey = docEvent.key();
 
-    if (type == DocumentEvent.Type.EXPIRATION || type == DocumentEvent.Type.DELETION) {
-      return handleDeletionOrExpiration(docEvent, type, builder);
-    } else if (type == DocumentEvent.Type.MUTATION) {
-      if (!isValidJson(docEvent.content())) {
-        LOGGER.warn("Skipping non-JSON document: bucket={} key={}", docEvent.bucket(), docEvent.qualifiedKey());
+    LOGGER.info("NDSourceHandler.buildValue() ENTRY - Document: {}, Type: {}", documentKey, type);
+
+    try {
+      if (type == DocumentEvent.Type.EXPIRATION || type == DocumentEvent.Type.DELETION) {
+        LOGGER.debug("NDSourceHandler.buildValue() - Handling deletion/expiration for document: {}", documentKey);
+        boolean result = handleDeletionOrExpiration(docEvent, type, builder);
+        long duration = (System.nanoTime() - startTime) / 1_000_000;
+        LOGGER.info("NDSourceHandler.buildValue() EXIT - Deletion/expiration result: {} for document: {} (took {}ms)",
+            result, documentKey, duration);
+        return result;
+      } else if (type == DocumentEvent.Type.MUTATION) {
+        LOGGER.debug("NDSourceHandler.buildValue() - Processing mutation for document: {}", documentKey);
+
+        if (!isValidJson(docEvent.content())) {
+          LOGGER.warn("NDSourceHandler.buildValue() - Skipping non-JSON document: bucket={} key={}",
+              docEvent.bucket(), docEvent.qualifiedKey());
+          return false;
+        }
+
+        // OPTIMIZATION 1: Apply lightweight filtering BEFORE expensive field extraction
+        LOGGER.debug("NDSourceHandler.buildValue() - Applying lightweight filter for document: {}", documentKey);
+        if (!passesLightweightFilter(docEvent.content())) {
+          LOGGER.debug(
+              "NDSourceHandler.buildValue() - Document filtered out by lightweight filter on field '{}' for document: {}",
+              filterField, documentKey);
+          return false;
+        }
+
+        // OPTIMIZATION 2: Only extract fields for documents that pass filtering
+        LOGGER.info("NDSourceHandler.buildValue() - Starting field extraction for document: {}", documentKey);
+        long extractionStart = System.nanoTime();
+        extractedFields = extractFields(docEvent.content());
+        long extractionDuration = (System.nanoTime() - extractionStart) / 1_000_000;
+        LOGGER.info(
+            "NDSourceHandler.buildValue() - Field extraction completed for document: {} (took {}ms, extracted {} fields)",
+            documentKey, extractionDuration, extractedFields != null ? extractedFields.size() : 0);
+
+        // Final validation using extracted fields (for cases where lightweight filter
+        // passed but full extraction reveals issues)
+        LOGGER.debug("NDSourceHandler.buildValue() - Applying value filter for document: {}", documentKey);
+        if (!passesValueFilter()) {
+          LOGGER.debug(
+              "NDSourceHandler.buildValue() - Document filtered out by full field validation on field '{}' for document: {}",
+              filterField, documentKey);
+          return false;
+        }
+
+        boolean result;
+        if (fields.size() == 1 && fields.get(0).equals("*")) {
+          LOGGER.debug("NDSourceHandler.buildValue() - Handling full document mutation for document: {}", documentKey);
+          result = handleFullDocumentMutation(docEvent, params, builder);
+        } else {
+          LOGGER.debug("NDSourceHandler.buildValue() - Handling specific fields extraction mutation for document: {}",
+              documentKey);
+          result = handleSpecificFieldsExtractionMutation(docEvent, type, params, builder);
+        }
+
+        long duration = (System.nanoTime() - startTime) / 1_000_000;
+        LOGGER.info("NDSourceHandler.buildValue() EXIT - Mutation result: {} for document: {} (took {}ms)",
+            result, documentKey, duration);
+        return result;
+      } else {
+        LOGGER.warn("NDSourceHandler.buildValue() - Unexpected event type {} for document: {}", type, documentKey);
         return false;
       }
-
-      // OPTIMIZATION 1: Apply lightweight filtering BEFORE expensive field extraction
-      if (!passesLightweightFilter(docEvent.content())) {
-        LOGGER.debug("Document filtered out by lightweight filter on field '{}'", filterField);
-        return false;
-      }
-
-      // OPTIMIZATION 2: Only extract fields for documents that pass filtering
-      extractedFields = extractFields(docEvent.content());
-
-      // Final validation using extracted fields (for cases where lightweight filter
-      // passed but full extraction reveals issues)
-      if (!passesValueFilter()) {
-        LOGGER.debug("Document filtered out by full field validation on field '{}'", filterField);
-        return false;
-      }
-
-      if (fields.size() == 1 && fields.get(0).equals("*")) {
-        return handleFullDocumentMutation(docEvent, params, builder);
-      }
-      return handleSpecificFieldsExtractionMutation(docEvent, type, params, builder);
-    } else {
-      LOGGER.warn("unexpected event type {}", type);
-      return false;
+    } catch (Exception e) {
+      long duration = (System.nanoTime() - startTime) / 1_000_000;
+      LOGGER.error("NDSourceHandler.buildValue() ERROR - Exception processing document: {} (took {}ms)",
+          documentKey, duration, e);
+      throw e;
     }
   }
 
