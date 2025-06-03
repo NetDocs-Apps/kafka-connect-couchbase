@@ -9,3 +9,7 @@ target/
 
 .DS_Store
 .vscode/settings.json
+
+# Investigation and analysis files
+*investigation-summary*.md
+*analysis*.md
