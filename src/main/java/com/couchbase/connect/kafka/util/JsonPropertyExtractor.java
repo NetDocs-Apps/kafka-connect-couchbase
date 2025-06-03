@@ -9,17 +9,22 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * Utility class for extracting specific properties from a JSON input stream.
  * This class provides memory-efficient parsing of JSON data without creating
  * objects for the entire JSON structure.
+ *
+ * Optimized version with early termination, path prefix checking, and improved
+ * string handling for better performance on large JSON documents.
  */
 public class JsonPropertyExtractor {
 
     /**
      * Extracts specified properties from a JSON input stream.
-     * 
+     *
      * @param inputStream The input stream containing JSON data.
      * @param paths       Array of property paths to extract.
      * @return A map containing the extracted properties and their values.
@@ -31,8 +36,8 @@ public class JsonPropertyExtractor {
     }
 
     /**
-     * Extracts specified properties from a JSON input stream.
-     * 
+     * Extracts specified properties from a JSON input stream with optimizations.
+     *
      * @param inputStream       The input stream containing JSON data.
      * @param desiredProperties Set of property paths to extract.
      * @return A map containing the extracted properties and their values.
@@ -43,69 +48,189 @@ public class JsonPropertyExtractor {
         Map<String, Object> result = new HashMap<>();
 
         try (JsonParser parser = factory.createParser(inputStream)) {
-            String currentPath = "";
-            processJsonToken(parser, currentPath, desiredProperties, result);
+            List<String> pathStack = new ArrayList<>();
+            processJsonToken(parser, pathStack, desiredProperties, result);
         }
 
         return result;
     }
 
     /**
-     * Recursively processes JSON tokens, extracting desired properties.
-     * 
+     * Checks if any desired property starts with the given path prefix.
+     * This optimization allows us to skip entire JSON subtrees that don't contain
+     * desired fields.
+     */
+    private static boolean hasMatchingPrefix(List<String> pathStack, Set<String> desiredProperties) {
+        if (pathStack.isEmpty()) {
+            return true; // Root level, always check
+        }
+
+        String currentPath = buildPath(pathStack);
+
+        // Check if any desired property starts with the current path
+        for (String prop : desiredProperties) {
+            if (prop.startsWith(currentPath)) {
+                return true;
+            }
+            // Also check if current path is a prefix of the property path
+            // This handles cases where we're building up to a desired path
+            if (currentPath.length() < prop.length()) {
+                String propPrefix = prop.substring(0, Math.min(currentPath.length(), prop.length()));
+                if (currentPath.equals(propPrefix)) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Builds the current path from the path stack efficiently.
+     * Handles array indices correctly (no dot before [index]).
+     */
+    private static String buildPath(List<String> pathStack) {
+        if (pathStack.isEmpty()) {
+            return "";
+        }
+
+        StringBuilder path = new StringBuilder();
+        for (int i = 0; i < pathStack.size(); i++) {
+            String segment = pathStack.get(i);
+            if (i == 0) {
+                path.append(segment);
+            } else if (segment.startsWith("[")) {
+                // Array index - no dot separator
+                path.append(segment);
+            } else {
+                // Regular field - add dot separator
+                path.append(".").append(segment);
+            }
+        }
+        return path.toString();
+    }
+
+    /**
+     * Recursively processes JSON tokens, extracting desired properties with
+     * optimizations.
+     *
      * @param parser            The JSON parser.
-     * @param currentPath       The current path in the JSON structure.
+     * @param pathStack         Stack representing the current path in the JSON
+     *                          structure.
      * @param desiredProperties Set of property paths to extract.
      * @param result            Map to store extracted properties and values.
      * @throws Exception If an error occurs during JSON parsing.
      */
-    private static void processJsonToken(JsonParser parser, String currentPath, Set<String> desiredProperties,
+    private static void processJsonToken(JsonParser parser, List<String> pathStack, Set<String> desiredProperties,
             Map<String, Object> result) throws Exception {
+
+        // Early termination: if we've found all desired properties, stop parsing
+        if (result.size() == desiredProperties.size()) {
+            return;
+        }
+
         while (parser.nextToken() != JsonToken.END_OBJECT) {
             String fieldName = parser.getCurrentName();
             if (fieldName != null) {
-                String newPath = currentPath.isEmpty() ? fieldName : currentPath + "." + fieldName;
+                pathStack.add(fieldName);
+                String currentPath = buildPath(pathStack);
                 JsonToken token = parser.nextToken();
 
-                if (desiredProperties.contains(newPath)) {
+                if (desiredProperties.contains(currentPath)) {
+                    // Found a desired field - extract its value
                     if (token == JsonToken.START_OBJECT) {
-                        result.put(newPath, parseComplexProperty(parser));
+                        result.put(currentPath, parseComplexProperty(parser));
                     } else if (token == JsonToken.START_ARRAY) {
-                        result.put(newPath, parseArray(parser));
+                        result.put(currentPath, parseArray(parser));
                     } else {
-                        result.put(newPath, getValueByType(parser));
+                        result.put(currentPath, getValueByType(parser));
                     }
-                } else if (token == JsonToken.START_OBJECT) {
-                    processJsonToken(parser, newPath, desiredProperties, result);
-                } else if (token == JsonToken.START_ARRAY) {
-                    processArray(parser, newPath, desiredProperties, result);
+                } else if (hasMatchingPrefix(pathStack, desiredProperties)) {
+                    // Only descend into objects/arrays if they might contain desired fields
+                    if (token == JsonToken.START_OBJECT) {
+                        processJsonToken(parser, pathStack, desiredProperties, result);
+                    } else if (token == JsonToken.START_ARRAY) {
+                        processArray(parser, pathStack, desiredProperties, result);
+                    }
+                } else {
+                    // Skip this subtree entirely - no desired fields here
+                    skipValue(parser, token);
+                }
+
+                pathStack.remove(pathStack.size() - 1); // Pop the field name
+
+                // Early termination check after processing each field
+                if (result.size() == desiredProperties.size()) {
+                    return;
                 }
             }
         }
     }
 
     /**
-     * Processes JSON arrays, handling nested objects and arrays.
-     * 
+     * Efficiently skips a JSON value without parsing it.
+     */
+    private static void skipValue(JsonParser parser, JsonToken token) throws Exception {
+        if (token == JsonToken.START_OBJECT) {
+            parser.skipChildren();
+        } else if (token == JsonToken.START_ARRAY) {
+            parser.skipChildren();
+        }
+        // For primitive values, no action needed - already consumed
+    }
+
+    /**
+     * Processes JSON arrays, handling nested objects and arrays with optimizations.
+     *
      * @param parser            The JSON parser.
-     * @param currentPath       The current path in the JSON structure.
+     * @param pathStack         Stack representing the current path in the JSON
+     *                          structure.
      * @param desiredProperties Set of property paths to extract.
      * @param result            Map to store extracted properties and values.
      * @throws Exception If an error occurs during JSON parsing.
      */
-    private static void processArray(JsonParser parser, String currentPath, Set<String> desiredProperties,
+    private static void processArray(JsonParser parser, List<String> pathStack, Set<String> desiredProperties,
             Map<String, Object> result) throws Exception {
+
+        // Early termination: if we've found all desired properties, stop parsing
+        if (result.size() == desiredProperties.size()) {
+            return;
+        }
+
         int index = 0;
         while (parser.nextToken() != JsonToken.END_ARRAY) {
-            String newPath = currentPath + "[" + index + "]";
-            if (parser.getCurrentToken() == JsonToken.START_OBJECT) {
-                processJsonToken(parser, newPath, desiredProperties, result);
-            } else if (parser.getCurrentToken() == JsonToken.START_ARRAY) {
-                processArray(parser, newPath, desiredProperties, result);
-            } else if (desiredProperties.contains(newPath)) {
-                result.put(newPath, getValueByType(parser));
+            String indexPath = "[" + index + "]";
+            pathStack.add(indexPath);
+            String currentPath = buildPath(pathStack);
+
+            if (desiredProperties.contains(currentPath)) {
+                // Found a desired array element
+                if (parser.getCurrentToken() == JsonToken.START_OBJECT) {
+                    result.put(currentPath, parseComplexProperty(parser));
+                } else if (parser.getCurrentToken() == JsonToken.START_ARRAY) {
+                    result.put(currentPath, parseArray(parser));
+                } else {
+                    result.put(currentPath, getValueByType(parser));
+                }
+            } else if (hasMatchingPrefix(pathStack, desiredProperties)) {
+                // Only descend if this array element might contain desired fields
+                if (parser.getCurrentToken() == JsonToken.START_OBJECT) {
+                    processJsonToken(parser, pathStack, desiredProperties, result);
+                } else if (parser.getCurrentToken() == JsonToken.START_ARRAY) {
+                    processArray(parser, pathStack, desiredProperties, result);
+                }
+            } else {
+                // Skip this array element entirely
+                skipValue(parser, parser.getCurrentToken());
             }
+
+            pathStack.remove(pathStack.size() - 1); // Pop the index
             index++;
+
+            // Early termination check after processing each array element
+            if (result.size() == desiredProperties.size()) {
+                return;
+            }
         }
     }
 
@@ -133,35 +258,24 @@ public class JsonPropertyExtractor {
     }
 
     /**
-     * Parses a JSON array into an Object array.
-     * 
+     * Parses a JSON array into a List for better performance and memory efficiency.
+     *
      * @param parser The JSON parser.
-     * @return An Object array representing the JSON array.
+     * @return A List representing the JSON array.
      * @throws Exception If an error occurs during JSON parsing.
      */
     private static Object parseArray(JsonParser parser) throws Exception {
-        Object[] array = new Object[10]; // Start with a small array size
-        int index = 0;
+        List<Object> array = new ArrayList<>();
         while (parser.nextToken() != JsonToken.END_ARRAY) {
-            if (index >= array.length) {
-                // Resize array if necessary
-                Object[] newArray = new Object[array.length * 2];
-                System.arraycopy(array, 0, newArray, 0, array.length);
-                array = newArray;
-            }
             if (parser.getCurrentToken() == JsonToken.START_OBJECT) {
-                array[index] = parseComplexProperty(parser);
+                array.add(parseComplexProperty(parser));
             } else if (parser.getCurrentToken() == JsonToken.START_ARRAY) {
-                array[index] = parseArray(parser);
+                array.add(parseArray(parser));
             } else {
-                array[index] = getValueByType(parser);
+                array.add(getValueByType(parser));
             }
-            index++;
         }
-        // Create a new array of exact size and copy elements
-        Object[] result = new Object[index];
-        System.arraycopy(array, 0, result, 0, index);
-        return result;
+        return array;
     }
 
     /**

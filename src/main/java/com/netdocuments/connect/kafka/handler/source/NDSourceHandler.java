@@ -43,6 +43,7 @@ import java.io.IOException;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.*;
+import java.util.concurrent.*;
 
 /**
  * NDSourceHandler extends RawJsonWithMetadataSourceHandler to provide custom
@@ -106,6 +107,9 @@ public class NDSourceHandler extends RawJsonWithMetadataSourceHandler {
   private static final String DOC_PROPS_ID_FIELD = "documents.1.docProps.id";
   private Map<String, Object> extractedFields;
 
+  // Executor service for timeout protection
+  private ExecutorService fieldExtractionExecutor;
+
   private Set<String> getAllFieldsToExtract() {
     Set<String> allFields = new HashSet<>(fields);
     if (filterField != null && !filterField.isEmpty()) {
@@ -115,22 +119,91 @@ public class NDSourceHandler extends RawJsonWithMetadataSourceHandler {
     return allFields;
   }
 
+  /**
+   * Performs lightweight filtering check by extracting only the filter field.
+   * This avoids expensive full field extraction for documents that will be
+   * filtered out.
+   */
+  private boolean passesLightweightFilter(byte[] content) {
+    if (filterField == null || filterField.isEmpty() || filterValues == null || filterValues.isEmpty()) {
+      return true; // No filtering configured
+    }
+
+    try {
+      // Extract only the filter field for lightweight check
+      Map<String, Object> filterFieldOnly = JsonPropertyExtractor.extract(
+          new ByteArrayInputStream(content),
+          new String[] { filterField });
+
+      Object fieldValue = filterFieldOnly.get(filterField);
+
+      // Handle null values
+      if (fieldValue == null || (fieldValue instanceof JsonNode && ((JsonNode) fieldValue).isNull())) {
+        LOGGER.debug("Filter field '{}' is null (filterAllowNull={})", filterField, filterAllowNull);
+        return filterAllowNull;
+      }
+
+      // Check filter values
+      if (fieldValue instanceof String) {
+        boolean matches = filterValues.contains(fieldValue);
+        LOGGER.debug("Filter field '{}' value '{}' matches: {}", filterField, fieldValue, matches);
+        return matches;
+      } else if (fieldValue instanceof List) {
+        @SuppressWarnings("unchecked")
+        List<String> values = (List<String>) fieldValue;
+        if (values.size() == 1) {
+          boolean matches = filterValues.contains(values.get(0));
+          LOGGER.debug("Filter field '{}' list value '{}' matches: {}", filterField, values.get(0), matches);
+          return matches;
+        }
+      }
+
+      LOGGER.debug("Filter field '{}' value type '{}' not supported, filtering out",
+          filterField, fieldValue.getClass().getName());
+      return false;
+
+    } catch (Exception e) {
+      LOGGER.warn("Error during lightweight filtering for field '{}', allowing document through", filterField, e);
+      return true; // Allow through on error to avoid blocking
+    }
+  }
+
+  /**
+   * Extracts all configured fields with timeout protection.
+   */
   Map<String, Object> extractFields(byte[] content) {
     try {
       Set<String> allFields = getAllFieldsToExtract();
-      extractedFields = JsonPropertyExtractor.extract(
-          new ByteArrayInputStream(content),
-          allFields.toArray(new String[0]));
+
+      // Use timeout protection for field extraction
+      Future<Map<String, Object>> future = fieldExtractionExecutor.submit(() -> {
+        return JsonPropertyExtractor.extract(
+            new ByteArrayInputStream(content),
+            allFields.toArray(new String[0]));
+      });
+
+      extractedFields = future.get(3, TimeUnit.SECONDS); // 3-second timeout
 
       // Add debug logging
-      LOGGER.info("Extracted fields: {}", extractedFields);
-      if (filterField != null) {
-        LOGGER.info("Filter field '{}' value: {}", filterField, extractedFields.get(filterField));
+      LOGGER.debug("Extracted {} fields successfully", extractedFields.size());
+      if (filterField != null && LOGGER.isDebugEnabled()) {
+        LOGGER.debug("Filter field '{}' value: {}", filterField, extractedFields.get(filterField));
       }
 
       return extractedFields;
+
+    } catch (TimeoutException e) {
+      LOGGER.warn("Field extraction timed out after 3 seconds, using empty field map");
+      return new HashMap<>();
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      LOGGER.warn("Field extraction was interrupted, using empty field map");
+      return new HashMap<>();
+    } catch (ExecutionException e) {
+      LOGGER.error("Error during field extraction", e.getCause());
+      return new HashMap<>();
     } catch (Exception e) {
-      LOGGER.error("Error while extracting fields from document", e);
+      LOGGER.error("Unexpected error while extracting fields from document", e);
       return new HashMap<>();
     }
   }
@@ -190,6 +263,8 @@ public class NDSourceHandler extends RawJsonWithMetadataSourceHandler {
 
     initializeHandlerProperties(config);
     initializeS3Client(config);
+    initializeFieldExtractionExecutor();
+
     filterField = config.getString(FILTER_FIELD_CONFIG);
     String filterValuesStr = config.getString(FILTER_VALUES_CONFIG);
     filterValues = filterValuesStr != null && !filterValuesStr.isEmpty()
@@ -200,6 +275,19 @@ public class NDSourceHandler extends RawJsonWithMetadataSourceHandler {
     if (filterField != null && !filterField.isEmpty() && filterValues != null && !filterValues.isEmpty()) {
       LOGGER.info("Initialized value filtering with field '{}' and values: {}", filterField, filterValues);
     }
+  }
+
+  /**
+   * Initializes the executor service for field extraction timeout protection.
+   */
+  private void initializeFieldExtractionExecutor() {
+    // Use a single-threaded executor with a meaningful thread name
+    fieldExtractionExecutor = Executors.newSingleThreadExecutor(r -> {
+      Thread t = new Thread(r, "field-extraction-timeout-" + Thread.currentThread().getName());
+      t.setDaemon(true); // Don't prevent JVM shutdown
+      return t;
+    });
+    LOGGER.info("Initialized field extraction executor with timeout protection");
   }
 
   /**
@@ -313,12 +401,19 @@ public class NDSourceHandler extends RawJsonWithMetadataSourceHandler {
         return false;
       }
 
-      // Extract all fields once
+      // OPTIMIZATION 1: Apply lightweight filtering BEFORE expensive field extraction
+      if (!passesLightweightFilter(docEvent.content())) {
+        LOGGER.debug("Document filtered out by lightweight filter on field '{}'", filterField);
+        return false;
+      }
+
+      // OPTIMIZATION 2: Only extract fields for documents that pass filtering
       extractedFields = extractFields(docEvent.content());
 
-      // Apply value filtering before proceeding
+      // Final validation using extracted fields (for cases where lightweight filter
+      // passed but full extraction reveals issues)
       if (!passesValueFilter()) {
-        LOGGER.debug("Document filtered out based on field {} values", filterField);
+        LOGGER.debug("Document filtered out by full field validation on field '{}'", filterField);
         return false;
       }
 
@@ -558,6 +653,27 @@ public class NDSourceHandler extends RawJsonWithMetadataSourceHandler {
    * This method should be called when the connector is stopping.
    */
   public void cleanup() {
+    // Shutdown field extraction executor
+    if (fieldExtractionExecutor != null) {
+      try {
+        LOGGER.info("Shutting down field extraction executor during handler cleanup");
+        fieldExtractionExecutor.shutdown();
+        if (!fieldExtractionExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
+          LOGGER.warn("Field extraction executor did not terminate gracefully, forcing shutdown");
+          fieldExtractionExecutor.shutdownNow();
+        }
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        LOGGER.warn("Interrupted while shutting down field extraction executor");
+        fieldExtractionExecutor.shutdownNow();
+      } catch (Exception e) {
+        LOGGER.warn("Error shutting down field extraction executor during cleanup", e);
+      } finally {
+        fieldExtractionExecutor = null;
+      }
+    }
+
+    // Shutdown S3 client
     if (s3Client != null) {
       try {
         LOGGER.info("Closing S3 client during handler cleanup");
