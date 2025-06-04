@@ -432,12 +432,17 @@ public class CouchbaseSourceTask extends SourceTask {
 
   private static boolean jsonpathMatch(JsonPath filter, byte[] document) {
     try {
-      if (filter == ROOT_JSON_PATH) {
+      if (filter == null || filter == ROOT_JSON_PATH) {
         return true;
       }
       List<?> result = filter.read(new ByteArrayInputStream(document), jsonpathConf);
       return !result.isEmpty();
     } catch (InvalidJsonException | IOException e) {
+      LOGGER.debug("JsonPath filter failed for document (size: {} bytes): {}", document.length, e.getMessage());
+      return false;
+    } catch (Exception e) {
+      LOGGER.warn("Unexpected error in JsonPath filter for document (size: {} bytes): {}", document.length,
+          e.getMessage(), e);
       return false;
     }
   }
