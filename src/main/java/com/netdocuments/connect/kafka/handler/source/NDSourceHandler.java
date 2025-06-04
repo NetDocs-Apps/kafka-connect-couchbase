@@ -120,55 +120,6 @@ public class NDSourceHandler extends RawJsonWithMetadataSourceHandler {
   }
 
   /**
-   * Performs lightweight filtering check by extracting only the filter field.
-   * This avoids expensive full field extraction for documents that will be
-   * filtered out.
-   */
-  private boolean passesLightweightFilter(byte[] content) {
-    if (filterField == null || filterField.isEmpty() || filterValues == null || filterValues.isEmpty()) {
-      return true; // No filtering configured
-    }
-
-    try {
-      // Extract only the filter field for lightweight check
-      Map<String, Object> filterFieldOnly = JsonPropertyExtractor.extract(
-          new ByteArrayInputStream(content),
-          new String[] { filterField });
-
-      Object fieldValue = filterFieldOnly.get(filterField);
-
-      // Handle null values
-      if (fieldValue == null || (fieldValue instanceof JsonNode && ((JsonNode) fieldValue).isNull())) {
-        LOGGER.debug("Filter field '{}' is null (filterAllowNull={})", filterField, filterAllowNull);
-        return filterAllowNull;
-      }
-
-      // Check filter values
-      if (fieldValue instanceof String) {
-        boolean matches = filterValues.contains(fieldValue);
-        LOGGER.debug("Filter field '{}' value '{}' matches: {}", filterField, fieldValue, matches);
-        return matches;
-      } else if (fieldValue instanceof List) {
-        @SuppressWarnings("unchecked")
-        List<String> values = (List<String>) fieldValue;
-        if (values.size() == 1) {
-          boolean matches = filterValues.contains(values.get(0));
-          LOGGER.debug("Filter field '{}' list value '{}' matches: {}", filterField, values.get(0), matches);
-          return matches;
-        }
-      }
-
-      LOGGER.debug("Filter field '{}' value type '{}' not supported, filtering out",
-          filterField, fieldValue.getClass().getName());
-      return false;
-
-    } catch (Exception e) {
-      LOGGER.warn("Error during lightweight filtering for field '{}', allowing document through", filterField, e);
-      return true; // Allow through on error to avoid blocking
-    }
-  }
-
-  /**
    * Extracts all configured fields with timeout protection.
    */
   Map<String, Object> extractFields(byte[] content) {
@@ -400,34 +351,40 @@ public class NDSourceHandler extends RawJsonWithMetadataSourceHandler {
     long startTime = System.nanoTime();
     String documentKey = params.documentEvent().key();
 
-    LOGGER.info("NDSourceHandler.handle() ENTRY - Processing document: {}", documentKey);
+    String correlationId = UUID.randomUUID().toString().substring(0, 6);
+
+    LOGGER.info("NDSourceHandler.handle({}) ENTRY - Processing document: {}", correlationId, documentKey);
 
     try {
       SourceRecordBuilder builder = new SourceRecordBuilder();
 
-      LOGGER.debug("NDSourceHandler.handle() - Adding CloudEvent headers for document: {}", documentKey);
+      LOGGER.debug("NDSourceHandler.handle({}) - Adding CloudEvent headers for document: {}", correlationId,
+          documentKey);
       addCloudEventHeaders(builder);
 
-      LOGGER.debug("NDSourceHandler.handle() - Building value for document: {}", documentKey);
+      LOGGER.debug("NDSourceHandler.handle({}) - Building value for document: {}", correlationId, documentKey);
       if (!buildValue(params, builder)) {
         long duration = (System.nanoTime() - startTime) / 1_000_000;
-        LOGGER.info("NDSourceHandler.handle() EXIT - Document filtered out: {} (took {}ms)", documentKey, duration);
+        LOGGER.info("NDSourceHandler.handle({}) EXIT - Document filtered out: {} (took {}ms)", correlationId,
+            documentKey, duration);
         return null;
       }
 
-      LOGGER.debug("NDSourceHandler.handle() - Setting topic and key for document: {}", documentKey);
+      LOGGER.debug("NDSourceHandler.handle({}) - Setting topic and key for document: {}", correlationId, documentKey);
       SourceRecordBuilder result = builder
           .topic(getTopic(params))
           .key(Schema.STRING_SCHEMA, documentKey);
 
       long duration = (System.nanoTime() - startTime) / 1_000_000;
-      LOGGER.info("NDSourceHandler.handle() EXIT - Successfully processed document: {} (took {}ms)", documentKey,
+      LOGGER.info("NDSourceHandler.handle({}) EXIT - Successfully processed document: {} (took {}ms)", correlationId,
+          documentKey,
           duration);
       return result;
 
     } catch (Exception e) {
       long duration = (System.nanoTime() - startTime) / 1_000_000;
-      LOGGER.error("NDSourceHandler.handle() ERROR - Exception processing document: {} (took {}ms)", documentKey,
+      LOGGER.error("NDSourceHandler.handle({}) ERROR - Exception processing document: {} (took {}ms)", correlationId,
+          documentKey,
           duration, e);
       throw e;
     }
@@ -455,7 +412,7 @@ public class NDSourceHandler extends RawJsonWithMetadataSourceHandler {
     final DocumentEvent.Type type = docEvent.type();
     String documentKey = docEvent.key();
 
-    LOGGER.info("NDSourceHandler.buildValue() ENTRY - Document: {}, Type: {}", documentKey, type);
+    LOGGER.info("NDSourceHandler.buildValue({}) ENTRY - Document: {}, Type: {}", documentKey, type);
 
     try {
       if (type == DocumentEvent.Type.EXPIRATION || type == DocumentEvent.Type.DELETION) {
@@ -474,16 +431,7 @@ public class NDSourceHandler extends RawJsonWithMetadataSourceHandler {
           return false;
         }
 
-        // OPTIMIZATION 1: Apply lightweight filtering BEFORE expensive field extraction
-        LOGGER.debug("NDSourceHandler.buildValue() - Applying lightweight filter for document: {}", documentKey);
-        if (!passesLightweightFilter(docEvent.content())) {
-          LOGGER.debug(
-              "NDSourceHandler.buildValue() - Document filtered out by lightweight filter on field '{}' for document: {}",
-              filterField, documentKey);
-          return false;
-        }
-
-        // OPTIMIZATION 2: Only extract fields for documents that pass filtering
+        // Extract fields once and use for filtering
         LOGGER.info("NDSourceHandler.buildValue() - Starting field extraction for document: {}", documentKey);
         long extractionStart = System.nanoTime();
         extractedFields = extractFields(docEvent.content());
@@ -492,12 +440,11 @@ public class NDSourceHandler extends RawJsonWithMetadataSourceHandler {
             "NDSourceHandler.buildValue() - Field extraction completed for document: {} (took {}ms, extracted {} fields)",
             documentKey, extractionDuration, extractedFields != null ? extractedFields.size() : 0);
 
-        // Final validation using extracted fields (for cases where lightweight filter
-        // passed but full extraction reveals issues)
+        // Apply filtering using extracted fields
         LOGGER.debug("NDSourceHandler.buildValue() - Applying value filter for document: {}", documentKey);
         if (!passesValueFilter()) {
           LOGGER.debug(
-              "NDSourceHandler.buildValue() - Document filtered out by full field validation on field '{}' for document: {}",
+              "NDSourceHandler.buildValue() - Document filtered out by field validation on field '{}' for document: {}",
               filterField, documentKey);
           return false;
         }
