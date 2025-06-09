@@ -345,6 +345,56 @@ class NDSourceHandlerTest {
     }
 
     @Test
+    void testHandleSpecificFieldsExtractionMutationWithS3UploadCreatesCloudEvent() throws Exception {
+        // Initialize handler with proper cloud event type template
+        initializeHandler(true, "field1,field2", 100, "test.event.{type}", ".s3");
+
+        // Prepare test data
+        String largeContent = "{\"field1\":\"" + "a".repeat(200) + "\",\"field2\":\"value2\"}";
+        when(mockDocEvent.type()).thenReturn(DocumentEvent.Type.MUTATION);
+        when(mockDocEvent.key()).thenReturn("MDucot5/qbti~240924115010829");
+        when(mockDocEvent.bucket()).thenReturn("testBucket");
+        when(mockDocEvent.revisionSeqno()).thenReturn(123L);
+
+        // Need to extract fields first
+        handler.extractFields(largeContent.getBytes());
+
+        handler.setS3Client(mockS3Client);
+
+        // Capture the value passed to builder
+        ArgumentCaptor<byte[]> valueCaptor = ArgumentCaptor.forClass(byte[].class);
+
+        // Act
+        boolean result = handler.handleSpecificFieldsExtractionMutation(mockDocEvent, DocumentEvent.Type.MUTATION,
+                mockParams, mockBuilder);
+
+        // Assert
+        assertTrue(result);
+        verify(mockBuilder).value(eq(null), valueCaptor.capture());
+        verify(mockS3Client).putObject(any(PutObjectRequest.class), any(RequestBody.class));
+
+        // Verify the captured value is a proper cloud event
+        byte[] capturedValue = valueCaptor.getValue();
+        JsonNode cloudEvent = objectMapper.readTree(capturedValue);
+
+        // Verify cloud event structure
+        assertEquals("1.0", cloudEvent.get("specversion").asText());
+        assertEquals("MDucot5/qbti~240924115010829-123", cloudEvent.get("id").asText());
+        assertEquals("test.event.mutation.s3", cloudEvent.get("type").asText());
+        assertEquals("netdocs://ndserver/testBucket", cloudEvent.get("source").asText());
+        assertNotNull(cloudEvent.get("time"));
+        assertEquals("application/json;charset=utf-8", cloudEvent.get("datacontenttype").asText());
+        assertEquals("MDucot5/qbti~240924115010829", cloudEvent.get("partitionkey").asText());
+        assertNotNull(cloudEvent.get("traceparent"));
+
+        // Verify the data contains S3 reference
+        JsonNode data = cloudEvent.get("data");
+        assertNotNull(data);
+        assertTrue(data.has("s3Bucket"));
+        assertTrue(data.has("s3Key"));
+    }
+
+    @Test
     void testHandleSpecificFieldsExtractionMutationWithInvalidJson() {
         // Initialize handler
         initializeHandler(true, "field1,field2", 100, "test.event", ".s3");

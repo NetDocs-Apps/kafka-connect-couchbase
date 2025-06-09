@@ -435,10 +435,14 @@ public class NDSourceHandler extends RawJsonWithMetadataSourceHandler {
 
     try {
       byte[] value = convertToBytes(newValue, docEvent, "");
+      String typeSuffix = "";
       if (value.length > s3Threshold) {
+        typeSuffix = s3Suffix;
         String s3Key = generateS3Key(docEvent);
         uploadToS3(s3Key, value);
         value = String.format("{\"s3Bucket\":\"%s\",\"s3Key\":\"%s\"}", s3Bucket, s3Key).getBytes();
+        // Wrap the S3 reference in a cloud event with the appropriate suffix
+        value = withCloudEvent(value, docEvent, typeSuffix);
       }
       builder.value(null, value);
       return true;
