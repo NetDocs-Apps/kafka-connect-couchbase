@@ -79,6 +79,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.SortedMap;
 import java.util.TreeMap;
+import java.util.UUID;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -338,6 +339,7 @@ public class CouchbaseSourceTask extends SourceTask {
   public List<SourceRecord> poll() throws InterruptedException {
     timeBetweenPollsTimer.record(endOfLastPoll.elapsed());
     watchdog.enterState("polling");
+    String correlationId = taskUuid();
 
     try {
       // If a fatal error occurred in another thread, propagate it.
@@ -375,7 +377,9 @@ public class CouchbaseSourceTask extends SourceTask {
         return results.records;
 
       } finally {
+        LOGGER.debug("Ack of events started. {}", correlationId);
         events.forEach(DocumentChange::flowControlAck);
+        LOGGER.debug("Ack of events finished. {}", correlationId);
       }
     } catch (Throwable t) {
       watchdog.enterState("polling reported error: " + t);
