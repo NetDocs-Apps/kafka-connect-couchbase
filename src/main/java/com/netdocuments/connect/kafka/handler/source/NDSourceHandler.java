@@ -40,6 +40,7 @@ import org.slf4j.LoggerFactory;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.time.Instant;
+
 import java.util.*;
 
 /**
@@ -528,7 +529,8 @@ public class NDSourceHandler extends RawJsonWithMetadataSourceHandler {
     data.put("id", documentEvent.key() + "-" + documentEvent.revisionSeqno());
     data.put("type", getCloudEventType(documentEvent, typeSuffix));
     data.put("source", "netdocs://ndserver/" + documentEvent.bucket());
-    data.put("time", Instant.now().toString());
+    Instant ts = documentEvent.timestamp();
+    data.put("time", (ts != null ? ts : Instant.now()).toString());
     data.put("datacontenttype", "application/json;charset=utf-8");
     data.put("partitionkey", documentEvent.key());
     data.put("traceparent", UUID.randomUUID().toString());

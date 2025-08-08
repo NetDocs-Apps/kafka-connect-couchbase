@@ -21,6 +21,8 @@ import com.couchbase.client.dcp.highlevel.DocumentChange;
 import com.couchbase.client.dcp.highlevel.Mutation;
 import com.couchbase.connect.kafka.config.source.DcpConfig;
 
+import java.time.Instant;
+
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
@@ -133,6 +135,13 @@ public class DocumentEvent {
   }
 
   /**
+   * Returns the Couchbase change timestamp for this event.
+   */
+  public Instant timestamp() {
+    return change.getTimestamp();
+  }
+
+  /**
    * Returns true if the document was created or updated,
    * otherwise false.
    */
@@ -151,7 +160,8 @@ public class DocumentEvent {
   }
 
   /**
-   * Returns information about the scope and collection associated with this event.
+   * Returns information about the scope and collection associated with this
+   * event.
    */
   public CollectionMetadata collectionMetadata() {
     return new CollectionMetadata(change);
