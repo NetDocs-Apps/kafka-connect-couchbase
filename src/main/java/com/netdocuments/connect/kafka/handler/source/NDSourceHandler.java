@@ -43,7 +43,6 @@ import org.slf4j.LoggerFactory;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.time.Instant;
-import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -117,8 +116,8 @@ public class NDSourceHandler extends RawJsonWithMetadataSourceHandler {
   // Timeout configuration for S3 and field extraction operations
   private static final Duration S3_API_CALL_TIMEOUT = Duration.ofSeconds(30);
   private static final Duration S3_API_CALL_ATTEMPT_TIMEOUT = Duration.ofSeconds(10);
-  private static final long FIELD_EXTRACTION_TIMEOUT_SECONDS = 3;
-  private static final int FIELD_EXTRACTION_MAX_RETRIES = 3;
+  private static final int S3_UPLOAD_MAX_RETRIES = 3;
+  private static final long FIELD_EXTRACTION_TIMEOUT_SECONDS = 10;
 
   // Executor for timeout-protected operations
   private final ExecutorService extractionExecutor = Executors.newCachedThreadPool();
@@ -135,55 +134,45 @@ public class NDSourceHandler extends RawJsonWithMetadataSourceHandler {
   }
 
   /**
-   * Extracts fields from document content with timeout protection and retry
-   * logic.
-   * If extraction times out, it will retry up to FIELD_EXTRACTION_MAX_RETRIES
-   * times
-   * before returning an empty map.
+   * Extracts fields from document content with timeout protection.
+   * If extraction takes longer than FIELD_EXTRACTION_TIMEOUT_SECONDS, it will be
+   * cancelled and an empty map will be returned to prevent blocking the
+   * connector.
    *
    * @param content The document content as bytes
    * @return Map of extracted field paths to values, or empty map on timeout/error
    */
   Map<String, Object> extractFields(byte[] content) {
     Set<String> allFields = getAllFieldsToExtract();
+    Future<Map<String, Object>> future = extractionExecutor.submit(() -> {
+      return JsonPropertyExtractor.extract(
+          new ByteArrayInputStream(content),
+          allFields.toArray(new String[0]));
+    });
 
-    for (int attempt = 1; attempt <= FIELD_EXTRACTION_MAX_RETRIES; attempt++) {
-      Future<Map<String, Object>> future = extractionExecutor.submit(() -> {
-        return JsonPropertyExtractor.extract(
-            new ByteArrayInputStream(content),
-            allFields.toArray(new String[0]));
-      });
+    try {
+      extractedFields = future.get(FIELD_EXTRACTION_TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
-      try {
-        extractedFields = future.get(FIELD_EXTRACTION_TIMEOUT_SECONDS, TimeUnit.SECONDS);
-
-        // Add debug logging
-        LOGGER.info("Extracted fields: {}", extractedFields);
-        if (filterField != null) {
-          LOGGER.info("Filter field '{}' value: {}", filterField, extractedFields.get(filterField));
-        }
-
-        return extractedFields;
-      } catch (TimeoutException e) {
-        future.cancel(true);
-        if (attempt < FIELD_EXTRACTION_MAX_RETRIES) {
-          LOGGER.warn("Field extraction timed out after {} seconds, retrying (attempt {}/{})",
-              FIELD_EXTRACTION_TIMEOUT_SECONDS, attempt, FIELD_EXTRACTION_MAX_RETRIES);
-        } else {
-          LOGGER.error("Field extraction timed out after {} attempts, returning empty map",
-              FIELD_EXTRACTION_MAX_RETRIES);
-        }
-      } catch (InterruptedException e) {
-        Thread.currentThread().interrupt();
-        LOGGER.error("Field extraction was interrupted", e);
-        return new HashMap<>();
-      } catch (ExecutionException e) {
-        LOGGER.error("Error while extracting fields from document", e.getCause());
-        return new HashMap<>();
+      // Add debug logging
+      LOGGER.info("Extracted fields: {}", extractedFields);
+      if (filterField != null) {
+        LOGGER.info("Filter field '{}' value: {}", filterField, extractedFields.get(filterField));
       }
-    }
 
-    return new HashMap<>();
+      return extractedFields;
+    } catch (TimeoutException e) {
+      future.cancel(true);
+      LOGGER.error("Field extraction timed out after {} seconds, returning empty map",
+          FIELD_EXTRACTION_TIMEOUT_SECONDS);
+      return new HashMap<>();
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      LOGGER.error("Field extraction was interrupted", e);
+      return new HashMap<>();
+    } catch (ExecutionException e) {
+      LOGGER.error("Error while extracting fields from document", e.getCause());
+      return new HashMap<>();
+    }
   }
 
   private boolean passesValueFilter() {
@@ -429,22 +418,33 @@ public class NDSourceHandler extends RawJsonWithMetadataSourceHandler {
   }
 
   /**
-   * Uploads the document content to S3.
+   * Uploads the document content to S3 with retry logic.
+   * Retries up to S3_UPLOAD_MAX_RETRIES times on failure before throwing.
    */
   private void uploadToS3(String s3Key, byte[] document) {
-    try {
-      PutObjectRequest putObjectRequest = PutObjectRequest.builder()
-          .bucket(s3Bucket)
-          .key(s3Key)
-          .contentType("application/json")
-          .build();
+    PutObjectRequest putObjectRequest = PutObjectRequest.builder()
+        .bucket(s3Bucket)
+        .key(s3Key)
+        .contentType("application/json")
+        .build();
 
-      s3Client.putObject(putObjectRequest, RequestBody.fromBytes(document));
-      LOGGER.debug("Uploaded document to S3: s3://{}/{}", s3Bucket, s3Key);
-    } catch (Exception e) {
-      LOGGER.error("Failed to upload document to S3: {}", e.getMessage(), e);
-      throw e;
+    Exception lastException = null;
+    for (int attempt = 1; attempt <= S3_UPLOAD_MAX_RETRIES; attempt++) {
+      try {
+        s3Client.putObject(putObjectRequest, RequestBody.fromBytes(document));
+        LOGGER.debug("Uploaded document to S3: s3://{}/{}", s3Bucket, s3Key);
+        return;
+      } catch (Exception e) {
+        lastException = e;
+        if (attempt < S3_UPLOAD_MAX_RETRIES) {
+          LOGGER.warn("Failed to upload document to S3 (attempt {}/{}): {}",
+              attempt, S3_UPLOAD_MAX_RETRIES, e.getMessage());
+        }
+      }
     }
+    LOGGER.error("Failed to upload document to S3 after {} attempts: {}",
+        S3_UPLOAD_MAX_RETRIES, lastException.getMessage(), lastException);
+    throw new RuntimeException("S3 upload failed after " + S3_UPLOAD_MAX_RETRIES + " attempts", lastException);
   }
 
   /**
