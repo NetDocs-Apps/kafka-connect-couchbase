@@ -118,6 +118,7 @@ public class NDSourceHandler extends RawJsonWithMetadataSourceHandler {
   private static final Duration S3_API_CALL_TIMEOUT = Duration.ofSeconds(30);
   private static final Duration S3_API_CALL_ATTEMPT_TIMEOUT = Duration.ofSeconds(10);
   private static final long FIELD_EXTRACTION_TIMEOUT_SECONDS = 3;
+  private static final int FIELD_EXTRACTION_MAX_RETRIES = 3;
 
   // Executor for timeout-protected operations
   private final ExecutorService extractionExecutor = Executors.newCachedThreadPool();
@@ -134,45 +135,55 @@ public class NDSourceHandler extends RawJsonWithMetadataSourceHandler {
   }
 
   /**
-   * Extracts fields from document content with timeout protection.
-   * If extraction takes longer than FIELD_EXTRACTION_TIMEOUT_SECONDS, it will be
-   * cancelled and an empty map will be returned to prevent blocking the
-   * connector.
+   * Extracts fields from document content with timeout protection and retry
+   * logic.
+   * If extraction times out, it will retry up to FIELD_EXTRACTION_MAX_RETRIES
+   * times
+   * before returning an empty map.
    *
    * @param content The document content as bytes
    * @return Map of extracted field paths to values, or empty map on timeout/error
    */
   Map<String, Object> extractFields(byte[] content) {
     Set<String> allFields = getAllFieldsToExtract();
-    Future<Map<String, Object>> future = extractionExecutor.submit(() -> {
-      return JsonPropertyExtractor.extract(
-          new ByteArrayInputStream(content),
-          allFields.toArray(new String[0]));
-    });
 
-    try {
-      extractedFields = future.get(FIELD_EXTRACTION_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+    for (int attempt = 1; attempt <= FIELD_EXTRACTION_MAX_RETRIES; attempt++) {
+      Future<Map<String, Object>> future = extractionExecutor.submit(() -> {
+        return JsonPropertyExtractor.extract(
+            new ByteArrayInputStream(content),
+            allFields.toArray(new String[0]));
+      });
 
-      // Add debug logging
-      LOGGER.info("Extracted fields: {}", extractedFields);
-      if (filterField != null) {
-        LOGGER.info("Filter field '{}' value: {}", filterField, extractedFields.get(filterField));
+      try {
+        extractedFields = future.get(FIELD_EXTRACTION_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+
+        // Add debug logging
+        LOGGER.info("Extracted fields: {}", extractedFields);
+        if (filterField != null) {
+          LOGGER.info("Filter field '{}' value: {}", filterField, extractedFields.get(filterField));
+        }
+
+        return extractedFields;
+      } catch (TimeoutException e) {
+        future.cancel(true);
+        if (attempt < FIELD_EXTRACTION_MAX_RETRIES) {
+          LOGGER.warn("Field extraction timed out after {} seconds, retrying (attempt {}/{})",
+              FIELD_EXTRACTION_TIMEOUT_SECONDS, attempt, FIELD_EXTRACTION_MAX_RETRIES);
+        } else {
+          LOGGER.error("Field extraction timed out after {} attempts, returning empty map",
+              FIELD_EXTRACTION_MAX_RETRIES);
+        }
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        LOGGER.error("Field extraction was interrupted", e);
+        return new HashMap<>();
+      } catch (ExecutionException e) {
+        LOGGER.error("Error while extracting fields from document", e.getCause());
+        return new HashMap<>();
       }
-
-      return extractedFields;
-    } catch (TimeoutException e) {
-      future.cancel(true);
-      LOGGER.error("Field extraction timed out after {} seconds, returning empty map",
-          FIELD_EXTRACTION_TIMEOUT_SECONDS);
-      return new HashMap<>();
-    } catch (InterruptedException e) {
-      Thread.currentThread().interrupt();
-      LOGGER.error("Field extraction was interrupted", e);
-      return new HashMap<>();
-    } catch (ExecutionException e) {
-      LOGGER.error("Error while extracting fields from document", e.getCause());
-      return new HashMap<>();
     }
+
+    return new HashMap<>();
   }
 
   private boolean passesValueFilter() {
