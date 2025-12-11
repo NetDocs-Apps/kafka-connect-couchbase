@@ -5,8 +5,10 @@ import com.fasterxml.jackson.core.JsonParser;
 import com.fasterxml.jackson.core.JsonToken;
 
 import java.io.InputStream;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -32,7 +34,7 @@ public class JsonPropertyExtractor {
 
     /**
      * Extracts specified properties from a JSON input stream.
-     * 
+     *
      * @param inputStream       The input stream containing JSON data.
      * @param desiredProperties Set of property paths to extract.
      * @return A map containing the extracted properties and their values.
@@ -41,10 +43,11 @@ public class JsonPropertyExtractor {
     public static Map<String, Object> extract(InputStream inputStream, Set<String> desiredProperties) throws Exception {
         JsonFactory factory = new JsonFactory();
         Map<String, Object> result = new HashMap<>();
+        Set<String> remainingProperties = new HashSet<>(desiredProperties);
 
         try (JsonParser parser = factory.createParser(inputStream)) {
             String currentPath = "";
-            processJsonToken(parser, currentPath, desiredProperties, result);
+            processJsonToken(parser, currentPath, remainingProperties, result);
         }
 
         return result;
@@ -52,22 +55,34 @@ public class JsonPropertyExtractor {
 
     /**
      * Recursively processes JSON tokens, extracting desired properties.
-     * 
-     * @param parser            The JSON parser.
-     * @param currentPath       The current path in the JSON structure.
-     * @param desiredProperties Set of property paths to extract.
-     * @param result            Map to store extracted properties and values.
+     *
+     * @param parser              The JSON parser.
+     * @param currentPath         The current path in the JSON structure.
+     * @param remainingProperties Set of property paths still to extract (modified
+     *                            in place).
+     * @param result              Map to store extracted properties and values.
      * @throws Exception If an error occurs during JSON parsing.
      */
-    private static void processJsonToken(JsonParser parser, String currentPath, Set<String> desiredProperties,
+    private static void processJsonToken(JsonParser parser, String currentPath, Set<String> remainingProperties,
             Map<String, Object> result) throws Exception {
-        while (parser.nextToken() != JsonToken.END_OBJECT) {
+        JsonToken token;
+        while ((token = parser.nextToken()) != JsonToken.END_OBJECT && token != null) {
+            // Early termination: if we've found all desired properties, skip the rest
+            if (remainingProperties.isEmpty()) {
+                skipRemainingTokens(parser);
+                return;
+            }
+
             String fieldName = parser.getCurrentName();
             if (fieldName != null) {
                 String newPath = currentPath.isEmpty() ? fieldName : currentPath + "." + fieldName;
-                JsonToken token = parser.nextToken();
+                token = parser.nextToken();
 
-                if (desiredProperties.contains(newPath)) {
+                if (token == null) {
+                    break;
+                }
+
+                if (remainingProperties.contains(newPath)) {
                     if (token == JsonToken.START_OBJECT) {
                         result.put(newPath, parseComplexProperty(parser));
                     } else if (token == JsonToken.START_ARRAY) {
@@ -75,35 +90,117 @@ public class JsonPropertyExtractor {
                     } else {
                         result.put(newPath, getValueByType(parser));
                     }
-                } else if (token == JsonToken.START_OBJECT) {
-                    processJsonToken(parser, newPath, desiredProperties, result);
-                } else if (token == JsonToken.START_ARRAY) {
-                    processArray(parser, newPath, desiredProperties, result);
+                    remainingProperties.remove(newPath);
+                } else if (shouldDescendIntoPath(newPath, remainingProperties)) {
+                    if (token == JsonToken.START_OBJECT) {
+                        processJsonToken(parser, newPath, remainingProperties, result);
+                    } else if (token == JsonToken.START_ARRAY) {
+                        processArray(parser, newPath, remainingProperties, result);
+                    }
+                } else {
+                    // Skip this value entirely as it's not needed
+                    skipValue(parser, token);
                 }
             }
         }
     }
 
     /**
-     * Processes JSON arrays, handling nested objects and arrays.
-     * 
-     * @param parser            The JSON parser.
-     * @param currentPath       The current path in the JSON structure.
-     * @param desiredProperties Set of property paths to extract.
-     * @param result            Map to store extracted properties and values.
+     * Checks if we should descend into a path to find nested properties.
+     *
+     * @param currentPath         The current path in the JSON structure.
+     * @param remainingProperties Set of property paths still to extract.
+     * @return true if any remaining property starts with the current path.
+     */
+    private static boolean shouldDescendIntoPath(String currentPath, Set<String> remainingProperties) {
+        String prefix = currentPath + ".";
+        String arrayPrefix = currentPath + "[";
+        for (String prop : remainingProperties) {
+            if (prop.startsWith(prefix) || prop.startsWith(arrayPrefix)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Skips a JSON value (object, array, or primitive) without parsing it.
+     * Uses Jackson's built-in skipChildren() method for efficient skipping
+     * of nested structures.
+     *
+     * @param parser       The JSON parser.
+     * @param currentToken The current token type.
      * @throws Exception If an error occurs during JSON parsing.
      */
-    private static void processArray(JsonParser parser, String currentPath, Set<String> desiredProperties,
+    private static void skipValue(JsonParser parser, JsonToken currentToken) throws Exception {
+        if (currentToken == JsonToken.START_OBJECT || currentToken == JsonToken.START_ARRAY) {
+            // Use Jackson's built-in method for efficient skipping
+            parser.skipChildren();
+        }
+        // For primitive values, we're already past them after nextToken()
+    }
+
+    /**
+     * Skips all remaining tokens until the end of the current object.
+     *
+     * @param parser The JSON parser.
+     * @throws Exception If an error occurs during JSON parsing.
+     */
+    private static void skipRemainingTokens(JsonParser parser) throws Exception {
+        int depth = 1;
+        while (depth > 0) {
+            JsonToken token = parser.nextToken();
+            if (token == null)
+                break;
+            if (token == JsonToken.START_OBJECT || token == JsonToken.START_ARRAY) {
+                depth++;
+            } else if (token == JsonToken.END_OBJECT || token == JsonToken.END_ARRAY) {
+                depth--;
+            }
+        }
+    }
+
+    /**
+     * Processes JSON arrays, handling nested objects and arrays.
+     *
+     * @param parser              The JSON parser.
+     * @param currentPath         The current path in the JSON structure.
+     * @param remainingProperties Set of property paths still to extract (modified
+     *                            in place).
+     * @param result              Map to store extracted properties and values.
+     * @throws Exception If an error occurs during JSON parsing.
+     */
+    private static void processArray(JsonParser parser, String currentPath, Set<String> remainingProperties,
             Map<String, Object> result) throws Exception {
         int index = 0;
-        while (parser.nextToken() != JsonToken.END_ARRAY) {
+        JsonToken token;
+        while ((token = parser.nextToken()) != JsonToken.END_ARRAY && token != null) {
+            // Early termination: if we've found all desired properties, skip the rest
+            if (remainingProperties.isEmpty()) {
+                skipRemainingTokens(parser);
+                return;
+            }
+
             String newPath = currentPath + "[" + index + "]";
-            if (parser.getCurrentToken() == JsonToken.START_OBJECT) {
-                processJsonToken(parser, newPath, desiredProperties, result);
-            } else if (parser.getCurrentToken() == JsonToken.START_ARRAY) {
-                processArray(parser, newPath, desiredProperties, result);
-            } else if (desiredProperties.contains(newPath)) {
-                result.put(newPath, getValueByType(parser));
+
+            if (remainingProperties.contains(newPath)) {
+                if (token == JsonToken.START_OBJECT) {
+                    result.put(newPath, parseComplexProperty(parser));
+                } else if (token == JsonToken.START_ARRAY) {
+                    result.put(newPath, parseArray(parser));
+                } else {
+                    result.put(newPath, getValueByType(parser));
+                }
+                remainingProperties.remove(newPath);
+            } else if (shouldDescendIntoPath(newPath, remainingProperties)) {
+                if (token == JsonToken.START_OBJECT) {
+                    processJsonToken(parser, newPath, remainingProperties, result);
+                } else if (token == JsonToken.START_ARRAY) {
+                    processArray(parser, newPath, remainingProperties, result);
+                }
+            } else {
+                // Skip this value entirely as it's not needed
+                skipValue(parser, token);
             }
             index++;
         }
@@ -133,35 +230,25 @@ public class JsonPropertyExtractor {
     }
 
     /**
-     * Parses a JSON array into an Object array.
-     * 
+     * Parses a JSON array into a List.
+     * Uses ArrayList for efficient dynamic sizing without manual array copying.
+     *
      * @param parser The JSON parser.
-     * @return An Object array representing the JSON array.
+     * @return A List representing the JSON array.
      * @throws Exception If an error occurs during JSON parsing.
      */
-    private static Object parseArray(JsonParser parser) throws Exception {
-        Object[] array = new Object[10]; // Start with a small array size
-        int index = 0;
+    private static List<Object> parseArray(JsonParser parser) throws Exception {
+        List<Object> list = new ArrayList<>();
         while (parser.nextToken() != JsonToken.END_ARRAY) {
-            if (index >= array.length) {
-                // Resize array if necessary
-                Object[] newArray = new Object[array.length * 2];
-                System.arraycopy(array, 0, newArray, 0, array.length);
-                array = newArray;
-            }
             if (parser.getCurrentToken() == JsonToken.START_OBJECT) {
-                array[index] = parseComplexProperty(parser);
+                list.add(parseComplexProperty(parser));
             } else if (parser.getCurrentToken() == JsonToken.START_ARRAY) {
-                array[index] = parseArray(parser);
+                list.add(parseArray(parser));
             } else {
-                array[index] = getValueByType(parser);
+                list.add(getValueByType(parser));
             }
-            index++;
         }
-        // Create a new array of exact size and copy elements
-        Object[] result = new Object[index];
-        System.arraycopy(array, 0, result, 0, index);
-        return result;
+        return list;
     }
 
     /**
