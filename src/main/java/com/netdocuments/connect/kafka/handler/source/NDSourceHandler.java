@@ -18,10 +18,13 @@ package com.netdocuments.connect.kafka.handler.source;
 import software.amazon.awssdk.auth.credentials.AwsCredentialsProviderChain;
 import software.amazon.awssdk.auth.credentials.EnvironmentVariableCredentialsProvider;
 import software.amazon.awssdk.auth.credentials.ProfileCredentialsProvider;
+import software.amazon.awssdk.core.client.config.ClientOverrideConfiguration;
 import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
+
+import java.time.Duration;
 
 import com.couchbase.client.core.deps.com.fasterxml.jackson.databind.JsonNode;
 import com.couchbase.client.core.deps.com.fasterxml.jackson.databind.ObjectMapper;
@@ -40,6 +43,13 @@ import org.slf4j.LoggerFactory;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.time.Instant;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+
 import java.util.*;
 
 /**
@@ -102,6 +112,16 @@ public class NDSourceHandler extends RawJsonWithMetadataSourceHandler {
   private Set<String> filterValues;
   private boolean filterAllowNull;
   private static final String DOC_PROPS_ID_FIELD = "documents.1.docProps.id";
+
+  // Timeout configuration for S3 and field extraction operations
+  private static final Duration S3_API_CALL_TIMEOUT = Duration.ofSeconds(30);
+  private static final Duration S3_API_CALL_ATTEMPT_TIMEOUT = Duration.ofSeconds(10);
+  private static final int S3_UPLOAD_MAX_RETRIES = 3;
+  private static final long FIELD_EXTRACTION_TIMEOUT_SECONDS = 10;
+
+  // Executor for timeout-protected operations
+  private final ExecutorService extractionExecutor = Executors.newCachedThreadPool();
+
   private Map<String, Object> extractedFields;
 
   private Set<String> getAllFieldsToExtract() {
@@ -113,12 +133,25 @@ public class NDSourceHandler extends RawJsonWithMetadataSourceHandler {
     return allFields;
   }
 
+  /**
+   * Extracts fields from document content with timeout protection.
+   * If extraction takes longer than FIELD_EXTRACTION_TIMEOUT_SECONDS, it will be
+   * cancelled and an empty map will be returned to prevent blocking the
+   * connector.
+   *
+   * @param content The document content as bytes
+   * @return Map of extracted field paths to values, or empty map on timeout/error
+   */
   Map<String, Object> extractFields(byte[] content) {
-    try {
-      Set<String> allFields = getAllFieldsToExtract();
-      extractedFields = JsonPropertyExtractor.extract(
+    Set<String> allFields = getAllFieldsToExtract();
+    Future<Map<String, Object>> future = extractionExecutor.submit(() -> {
+      return JsonPropertyExtractor.extract(
           new ByteArrayInputStream(content),
           allFields.toArray(new String[0]));
+    });
+
+    try {
+      extractedFields = future.get(FIELD_EXTRACTION_TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
       // Add debug logging
       LOGGER.info("Extracted fields: {}", extractedFields);
@@ -127,8 +160,17 @@ public class NDSourceHandler extends RawJsonWithMetadataSourceHandler {
       }
 
       return extractedFields;
-    } catch (Exception e) {
-      LOGGER.error("Error while extracting fields from document", e);
+    } catch (TimeoutException e) {
+      future.cancel(true);
+      LOGGER.error("Field extraction timed out after {} seconds, returning empty map",
+          FIELD_EXTRACTION_TIMEOUT_SECONDS);
+      return new HashMap<>();
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      LOGGER.error("Field extraction was interrupted", e);
+      return new HashMap<>();
+    } catch (ExecutionException e) {
+      LOGGER.error("Error while extracting fields from document", e.getCause());
       return new HashMap<>();
     }
   }
@@ -216,7 +258,9 @@ public class NDSourceHandler extends RawJsonWithMetadataSourceHandler {
   }
 
   /**
-   * Initializes the S3 client for document uploads.
+   * Initializes the S3 client for document uploads with timeout protection.
+   * Configures API call timeout and per-attempt timeout to prevent indefinite
+   * blocking.
    */
   private void initializeS3Client(AbstractConfig config) {
     s3Bucket = config.getString(S3_BUCKET_CONFIG);
@@ -228,10 +272,20 @@ public class NDSourceHandler extends RawJsonWithMetadataSourceHandler {
     if (s3Bucket == null || s3Region == null) {
       isS3Enabled = false;
     } else {
-      // Initialize S3 client
+      // Initialize S3 client with timeout configuration
       isS3Enabled = true;
       awsProfile = config.getString(AWS_PROFILE_CONFIG);
-      LOGGER.info("Initializing S3 client with bucket={}, region={}, profile={}", s3Bucket, s3Region, awsProfile);
+      LOGGER.info(
+          "Initializing S3 client with bucket={}, region={}, profile={}, apiCallTimeout={}s, attemptTimeout={}s",
+          s3Bucket, s3Region, awsProfile,
+          S3_API_CALL_TIMEOUT.getSeconds(), S3_API_CALL_ATTEMPT_TIMEOUT.getSeconds());
+
+      // Configure timeouts to prevent indefinite blocking on S3 operations
+      ClientOverrideConfiguration overrideConfig = ClientOverrideConfiguration.builder()
+          .apiCallTimeout(S3_API_CALL_TIMEOUT)
+          .apiCallAttemptTimeout(S3_API_CALL_ATTEMPT_TIMEOUT)
+          .build();
+
       if (awsProfile != null) {
         ProfileCredentialsProvider credentialsProvider = ProfileCredentialsProvider.builder()
             .profileName(awsProfile) // Your desired profile name
@@ -243,10 +297,12 @@ public class NDSourceHandler extends RawJsonWithMetadataSourceHandler {
         s3Client = S3Client.builder()
             .region(Region.of(s3Region))
             .credentialsProvider(credentialsProviderChain)
+            .overrideConfiguration(overrideConfig)
             .build();
       } else {
         s3Client = S3Client.builder()
             .region(Region.of(s3Region))
+            .overrideConfiguration(overrideConfig)
             .build();
       }
     }
@@ -362,22 +418,33 @@ public class NDSourceHandler extends RawJsonWithMetadataSourceHandler {
   }
 
   /**
-   * Uploads the document content to S3.
+   * Uploads the document content to S3 with retry logic.
+   * Retries up to S3_UPLOAD_MAX_RETRIES times on failure before throwing.
    */
   private void uploadToS3(String s3Key, byte[] document) {
-    try {
-      PutObjectRequest putObjectRequest = PutObjectRequest.builder()
-          .bucket(s3Bucket)
-          .key(s3Key)
-          .contentType("application/json")
-          .build();
+    PutObjectRequest putObjectRequest = PutObjectRequest.builder()
+        .bucket(s3Bucket)
+        .key(s3Key)
+        .contentType("application/json")
+        .build();
 
-      s3Client.putObject(putObjectRequest, RequestBody.fromBytes(document));
-      LOGGER.debug("Uploaded document to S3: s3://{}/{}", s3Bucket, s3Key);
-    } catch (Exception e) {
-      LOGGER.error("Failed to upload document to S3: {}", e.getMessage(), e);
-      throw e;
+    Exception lastException = null;
+    for (int attempt = 1; attempt <= S3_UPLOAD_MAX_RETRIES; attempt++) {
+      try {
+        s3Client.putObject(putObjectRequest, RequestBody.fromBytes(document));
+        LOGGER.debug("Uploaded document to S3: s3://{}/{}", s3Bucket, s3Key);
+        return;
+      } catch (Exception e) {
+        lastException = e;
+        if (attempt < S3_UPLOAD_MAX_RETRIES) {
+          LOGGER.warn("Failed to upload document to S3 (attempt {}/{}): {}",
+              attempt, S3_UPLOAD_MAX_RETRIES, e.getMessage());
+        }
+      }
     }
+    LOGGER.error("Failed to upload document to S3 after {} attempts: {}",
+        S3_UPLOAD_MAX_RETRIES, lastException.getMessage(), lastException);
+    throw new RuntimeException("S3 upload failed after " + S3_UPLOAD_MAX_RETRIES + " attempts", lastException);
   }
 
   /**
@@ -528,7 +595,8 @@ public class NDSourceHandler extends RawJsonWithMetadataSourceHandler {
     data.put("id", documentEvent.key() + "-" + documentEvent.revisionSeqno());
     data.put("type", getCloudEventType(documentEvent, typeSuffix));
     data.put("source", "netdocs://ndserver/" + documentEvent.bucket());
-    data.put("time", Instant.now().toString());
+    Instant ts = documentEvent.timestamp();
+    data.put("time", (ts != null ? ts : Instant.now()).toString());
     data.put("datacontenttype", "application/json;charset=utf-8");
     data.put("partitionkey", documentEvent.key());
     data.put("traceparent", UUID.randomUUID().toString());

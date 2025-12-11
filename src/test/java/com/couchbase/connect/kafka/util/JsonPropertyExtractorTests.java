@@ -145,4 +145,116 @@ class JsonPropertyExtractorTests {
         assertNull(result.get("age"));
         assertNull(result.get("address"));
     }
+
+    /**
+     * Test early termination optimization with large JSON document.
+     * This test verifies that the extractor stops parsing once all desired
+     * properties are found, even if there's a lot more data in the JSON.
+     * This is critical for performance when extracting a few fields from
+     * very large documents.
+     */
+    @Test
+    void testEarlyTerminationWithLargeDocument() throws Exception {
+        // Create a JSON with desired property early, followed by massive unused data
+        StringBuilder jsonBuilder = new StringBuilder();
+        jsonBuilder.append("{\"targetField\":\"found\",");
+
+        // Add 1000 large unused fields after the target
+        for (int i = 0; i < 1000; i++) {
+            jsonBuilder.append("\"unused").append(i).append("\":{");
+            jsonBuilder.append("\"data\":\"").append("x".repeat(1000)).append("\",");
+            jsonBuilder.append("\"nested\":{\"deep\":\"value\"}");
+            jsonBuilder.append("}");
+            if (i < 999) {
+                jsonBuilder.append(",");
+            }
+        }
+        jsonBuilder.append("}");
+
+        String json = jsonBuilder.toString();
+        InputStream inputStream = new ByteArrayInputStream(json.getBytes());
+        Set<String> desiredProperties = new HashSet<>(Arrays.asList("targetField"));
+
+        long startTime = System.currentTimeMillis();
+        Map<String, Object> result = JsonPropertyExtractor.extract(inputStream, desiredProperties);
+        long duration = System.currentTimeMillis() - startTime;
+
+        assertEquals(1, result.size());
+        assertEquals("found", result.get("targetField"));
+
+        // With early termination, this should complete very quickly (< 100ms)
+        // Without it, parsing all 1000 large objects would take much longer
+        assertTrue(duration < 100, "Extraction took " + duration + "ms, expected < 100ms with early termination");
+    }
+
+    /**
+     * Test early termination with array elements.
+     * This test verifies that the extractor efficiently handles arrays when
+     * only specific indices are needed.
+     */
+    @Test
+    void testEarlyTerminationWithArrays() throws Exception {
+        // Create JSON with target array element early, followed by many unused elements
+        StringBuilder jsonBuilder = new StringBuilder();
+        jsonBuilder.append("{\"items\":[");
+
+        // Add target element at index 0
+        jsonBuilder.append("{\"id\":\"target\",\"value\":123}");
+
+        // Add 1000 large unused array elements
+        for (int i = 1; i < 1001; i++) {
+            jsonBuilder.append(",{\"id\":\"unused").append(i).append("\",");
+            jsonBuilder.append("\"largeData\":\"").append("y".repeat(1000)).append("\"}");
+        }
+        jsonBuilder.append("]}");
+
+        String json = jsonBuilder.toString();
+        InputStream inputStream = new ByteArrayInputStream(json.getBytes());
+        Set<String> desiredProperties = new HashSet<>(Arrays.asList("items[0]"));
+
+        long startTime = System.currentTimeMillis();
+        Map<String, Object> result = JsonPropertyExtractor.extract(inputStream, desiredProperties);
+        long duration = System.currentTimeMillis() - startTime;
+
+        assertEquals(1, result.size());
+        @SuppressWarnings("unchecked")
+        Map<String, Object> item = (Map<String, Object>) result.get("items[0]");
+        assertNotNull(item);
+        assertEquals("target", item.get("id"));
+        assertEquals(123, item.get("value"));
+
+        // Should complete quickly with early termination
+        assertTrue(duration < 100, "Extraction took " + duration + "ms, expected < 100ms with early termination");
+    }
+
+    /**
+     * Test that skipping works correctly for nested structures.
+     * This verifies that when we don't need a nested object or array,
+     * we skip it entirely without parsing its contents.
+     */
+    @Test
+    void testSkippingNestedStructures() throws Exception {
+        String json = "{" +
+                "\"needed\":\"value\"," +
+                "\"skipThis\":{" +
+                "\"deep\":{" +
+                "\"nested\":{" +
+                "\"structure\":[1,2,3,{\"more\":\"data\"}]" +
+                "}" +
+                "}" +
+                "}," +
+                "\"alsoNeeded\":42" +
+                "}";
+
+        InputStream inputStream = new ByteArrayInputStream(json.getBytes());
+        Set<String> desiredProperties = new HashSet<>(Arrays.asList("needed", "alsoNeeded"));
+
+        Map<String, Object> result = JsonPropertyExtractor.extract(inputStream, desiredProperties);
+
+        assertEquals(2, result.size());
+        assertEquals("value", result.get("needed"));
+        assertEquals(42, result.get("alsoNeeded"));
+        // Verify that skipThis was not parsed
+        assertFalse(result.containsKey("skipThis"));
+    }
 }
