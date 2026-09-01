@@ -25,8 +25,17 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import java.io.IOException;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.IdentityHashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 import org.apache.kafka.common.config.AbstractConfig;
 import org.apache.kafka.common.config.ConfigDef;
@@ -162,6 +171,42 @@ public class SecretsManagerConfigProviderTest {
 
         assertNotNull(after);
         assertNotSame(before, after, "client must be rebuilt after close()");
+    }
+
+    /**
+     * Concurrency guard: many threads hitting the re-init path at once (after close())
+     * must serialize on the synchronized method and end up sharing a single rebuilt
+     * client, never building more than one.
+     */
+    @Test
+    public void testConcurrentReInitBuildsSingleClient() throws Exception {
+        final SecretsManagerConfigProvider provider = new SecretsManagerConfigProvider();
+        Map<String, Object> cfg = new HashMap<>();
+        cfg.put(CommonConfigUtils.REGION, "us-west-2");
+        provider.configure(cfg);
+        provider.close(); // null the client so the next lookups take the build path
+
+        final int threads = 16;
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        final CountDownLatch release = new CountDownLatch(1);
+        List<Future<SecretsManagerClient>> futures = new ArrayList<>();
+        try {
+            for (int i = 0; i < threads; i++) {
+                futures.add(pool.submit(() -> {
+                    release.await(); // line all threads up before the race
+                    return provider.checkOrInitSecretManagerClient();
+                }));
+            }
+            release.countDown();
+
+            Set<SecretsManagerClient> distinct = Collections.newSetFromMap(new IdentityHashMap<>());
+            for (Future<SecretsManagerClient> f : futures) {
+                distinct.add(f.get());
+            }
+            assertEquals(1, distinct.size(), "concurrent callers must share one client instance");
+        } finally {
+            pool.shutdownNow();
+        }
     }
 
     static class CustomConfig extends AbstractConfig {

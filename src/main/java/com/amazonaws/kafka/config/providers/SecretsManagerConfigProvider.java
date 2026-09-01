@@ -205,7 +205,7 @@ public class SecretsManagerConfigProvider extends AwsServiceConfigProvider {
     }
 
     @Override
-    public void close() throws IOException {
+    public synchronized void close() throws IOException {
         if (this.secretsManager != null) {
             this.secretsManager.close();
             this.secretsManager = null;
