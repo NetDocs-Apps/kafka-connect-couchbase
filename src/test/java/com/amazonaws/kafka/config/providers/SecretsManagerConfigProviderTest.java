@@ -17,8 +17,12 @@
 package com.amazonaws.kafka.config.providers;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
+import java.io.IOException;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
@@ -31,7 +35,10 @@ import org.apache.kafka.common.config.ConfigDef.Type;
 import org.apache.kafka.common.config.ConfigException;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import software.amazon.awssdk.services.secretsmanager.SecretsManagerClient;
 import software.amazon.awssdk.services.secretsmanager.model.ResourceNotFoundException;
+
+import com.amazonaws.kafka.config.providers.common.CommonConfigUtils;
 
 public class SecretsManagerConfigProviderTest {
 
@@ -119,6 +126,42 @@ public class SecretsManagerConfigProviderTest {
     public void testNonExistingKey() {
         props.put("notFound", "${secretsmanager:AmazonMSK_TestKafkaConfig:noKey}");
         assertThrows(ConfigException.class, () -> new CustomConfig(props));
+    }
+
+    /**
+     * Regression guard for the thread-safety fix: the client must be built once in
+     * configure() and reused, not rebuilt on every lookup from a shared mutable builder.
+     */
+    @Test
+    public void testSecretsManagerClientIsBuiltOnceAndReused() {
+        SecretsManagerConfigProvider provider = new SecretsManagerConfigProvider();
+        Map<String, Object> cfg = new HashMap<>();
+        cfg.put(CommonConfigUtils.REGION, "us-west-2");
+        provider.configure(cfg);
+
+        SecretsManagerClient first = provider.checkOrInitSecretManagerClient();
+        SecretsManagerClient second = provider.checkOrInitSecretManagerClient();
+
+        assertNotNull(first);
+        assertSame(first, second, "client must be built once and reused");
+    }
+
+    /**
+     * After close() the client is released; the next lookup must lazily rebuild it.
+     */
+    @Test
+    public void testClientReInitializedAfterClose() throws IOException {
+        SecretsManagerConfigProvider provider = new SecretsManagerConfigProvider();
+        Map<String, Object> cfg = new HashMap<>();
+        cfg.put(CommonConfigUtils.REGION, "us-west-2");
+        provider.configure(cfg);
+
+        SecretsManagerClient before = provider.checkOrInitSecretManagerClient();
+        provider.close();
+        SecretsManagerClient after = provider.checkOrInitSecretManagerClient();
+
+        assertNotNull(after);
+        assertNotSame(before, after, "client must be rebuilt after close()");
     }
 
     static class CustomConfig extends AbstractConfig {

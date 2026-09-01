@@ -99,18 +99,25 @@ public class SecretsManagerConfigProvider extends AwsServiceConfigProvider {
     private SecretsManagerConfig config;
     private String notFoundStrategy;
 
-    private SecretsManagerClientBuilder cBuilder;
+    private SecretsManagerClient secretsManager;
 
     @Override
     public void configure(Map<String, ?> configs) {
         this.config = new SecretsManagerConfig(configs);
+        configure(this.config);
+    }
+
+    public void configure(SecretsManagerConfig configs) {
         setCommonConfig(config);
 
         this.notFoundStrategy = config.getString(SecretsManagerConfig.NOT_FOUND_STRATEGY);
 
-        // set up a builder:
-        this.cBuilder = SecretsManagerClient.builder();
-        setClientCommonConfig(this.cBuilder);
+        // Build the client once and reuse it. AWS SDK v2 client builders are not
+        // thread-safe, so calling build() per lookup could race during concurrent
+        // config validation and produce a client without the configured region.
+        SecretsManagerClientBuilder cBuilder = SecretsManagerClient.builder();
+        setClientCommonConfig(cBuilder);
+        this.secretsManager = cBuilder.build();
     }
 
     /**
@@ -185,8 +192,11 @@ public class SecretsManagerConfigProvider extends AwsServiceConfigProvider {
         return ttl == null ? new ConfigData(data) : new ConfigData(data, ttl);
     }
 
-    protected SecretsManagerClient checkOrInitSecretManagerClient() {
-        return cBuilder.build();
+    protected synchronized SecretsManagerClient checkOrInitSecretManagerClient() {
+        if (secretsManager == null) {
+            configure(config);
+        }
+        return this.secretsManager;
     }
 
     @Override
@@ -196,6 +206,11 @@ public class SecretsManagerConfigProvider extends AwsServiceConfigProvider {
 
     @Override
     public void close() throws IOException {
+        if (this.secretsManager != null) {
+            this.secretsManager.close();
+            this.secretsManager = null;
+        }
+        super.close();
     }
 
     private void handleNotFoundByStrategy(Map<String, String> data, String path, String key, RuntimeException e) {
