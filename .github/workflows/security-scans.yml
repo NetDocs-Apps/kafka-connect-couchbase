@@ -1,0 +1,16 @@
+name: Security Scans
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+
+permissions:
+  actions: read
+  contents: read
+  security-events: write
+
+jobs:
+  security:
+    uses: NetDocs-Security/gh-security-workflows/.github/workflows/security-scans.yml@main
+    secrets: inherit
